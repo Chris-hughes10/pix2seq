@@ -2,6 +2,8 @@
 
 A PyTorch implementation of Pix2Seq for object detection, where detection is formulated as an autoregressive sequence generation task. This implementation supports both standard transformer and Llama-based architectures.
 
+This repo is meant to accompany [this blog post](https://medium.com/@chris.p.hughes10/rethinking-object-detection-as-language-modelling-lessons-from-reimplementing-pix2seq-049104083747?source=friends_link&sk=91f149231a805674299f7a80e556b6f6).
+
 ## Features
 
 - **Sequence-based object detection**: Objects represented as token sequences `[y1 x1 y2 x2 class]`
