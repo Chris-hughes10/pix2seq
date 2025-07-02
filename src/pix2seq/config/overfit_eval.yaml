@@ -1,0 +1,59 @@
+data:
+  num_classes: 80
+  max_instances: 65
+  class_label_corruption: "none"
+  image_size: 640
+  jitter_scale: [0.3, 2.0]
+  color_jitter_strength: 0.4
+
+tokenization:
+  quantization_bins: 1000
+  noise_bbox_weight: 0
+  eos_token_weight: 0.1
+  mix_rate: 0.5
+  random_ordering: false
+
+model:
+  patch_size: 16
+  num_encoder_layers: 6
+  num_decoder_layers: 6
+  d_model: 256
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.
+  drop_path: 0.
+  shared_decoder_embedding: true
+  decoder_output_bias: true
+  pad_token_id: 0
+  eos_token_id: 1
+  llama_model: true
+  pretrained_path:
+  # pretrained_path: /workspaces/object-detection-rl/models/overfit_eval_pix2seq/v2/final_model.pt
+  # pretrained_path: /workspaces/object-detection-rl/models/overfit_eval_pix2seq/v4/final_model.pt
+
+training:
+  output_dir: "./outputs"
+  predictions_dir: "predictions"
+  num_epochs: 300
+  max_steps: 
+  batch_size: 64
+  eval_batch_size: 50
+  gradient_accumulation_steps: 1
+  gradient_clip_value: null
+  learning_rate: 0.0006
+  weight_decay: 0.05
+  warmup_epochs: 2
+  beta1: 0.9
+  beta2: 0.95
+  eps: 0.00000001
+  run_eval_freq: 20
+  overfit_eval_set: true
+  num_visualizations: 4
+  use_wsd_scheduler: true
+ 
+ 
+
+generation:
+  top_p: 0.4
+  top_k: 0
+  temperature: 1.0

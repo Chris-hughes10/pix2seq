@@ -1,0 +1,22 @@
+channels:
+  - conda-forge
+  - nvidia
+  - pytorch
+dependencies:
+  - python=3.12
+  - pytorch-cuda=12.1
+  - cuda-compiler=12.1
+  - pip:
+    # cleaner scripts than using argparse
+    - func-to-script==1.0.0
+    # minimum mlflow packages required for logging in AzureML
+    - azureml-mlflow==1.59.0
+    - pandas==2.2.2
+    - torchvision
+    - pycocotools==2.0.8
+    - albumentations==1.4.22
+    - timm
+    - seaborn
+    - pytorch-accelerated==0.1.54
+    - torch==2.6
+

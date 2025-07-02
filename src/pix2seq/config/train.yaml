@@ -1,0 +1,55 @@
+data:
+  num_classes: 80
+  max_instances: 100
+  class_label_corruption: "rand_n_fake_cls"
+  image_size: 640
+  jitter_scale: [0.3, 2.0]
+  color_jitter_strength: 0.5
+
+tokenization:
+  quantization_bins: 1000
+  noise_bbox_weight: 1.0
+  eos_token_weight: 0.1
+  mix_rate: 0.5
+  random_ordering: true
+
+model:
+  patch_size: 16
+  num_encoder_layers: 6
+  num_decoder_layers: 6
+  d_model: 256
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.1
+  drop_path: 0.1
+  shared_decoder_embedding: true
+  decoder_output_bias: true
+  pad_token_id: 0
+  eos_token_id: 1
+  llama_model: true
+  pretrained_path: 
+
+training:
+  output_dir: "./outputs"
+  predictions_dir: "predictions"
+  num_epochs: 300
+  max_steps: null
+  batch_size: 64
+  eval_batch_size: 50
+  gradient_accumulation_steps: 1
+  gradient_clip_value: null
+  learning_rate: 0.0003
+  weight_decay: 0.05
+  warmup_epochs: 10
+  beta1: 0.9
+  beta2: 0.95
+  eps: 0.00000001
+  run_eval_freq: 10
+  overfit_eval_set: false
+  num_visualizations: 5
+  use_wsd_scheduler: true
+
+generation:
+  top_p: 0.4
+  top_k: 0
+  temperature: 1.0

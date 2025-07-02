@@ -1,0 +1,37 @@
+// File only needed for VSCode users to have proper Docker based interpreters
+{
+    "name": "pix2seq",
+    "build": {
+         "dockerfile": "../../src/pix2seq/environment/Dockerfile"
+    },
+    "runArgs": [
+        // ACTION NEEDED: uncomment the next line if your local machine has GPUs available
+        // "--gpus", "all",
+        // Enable the docker container to access system resources
+        "--ipc", "host",
+        // mount cloudfiles to the container
+        "-v", "/home/azureuser/cloudfiles:/cloudfiles"
+    ],
+    "remoteEnv": {
+        "PYTHONPATH": "${containerEnv:PATH}:${containerWorkspaceFolder}/src/pix2seq:${containerWorkspaceFolder}/src",
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Ensure we have IntelliSense in VSCode when running inside container
+                "EditorConfig.EditorConfig",
+                "ms-python.python",
+                "GitHub.copilot",
+                "blackCodeFormatter.black",
+                "ms-toolsai.jupyter",
+                "redhat.vscode-yaml",
+                "charliermarsh.ruff"
+            ]
+        }
+    },
+    "workspaceFolder": "/workspaces/pix2seq",
+    // Need git for VSCode to color code modifications. Only runs when building environment.
+    "features": {
+        "ghcr.io/devcontainers/features/git:1": {"version": "latest"}
+    }
+}

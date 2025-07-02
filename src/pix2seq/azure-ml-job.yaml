@@ -1,0 +1,47 @@
+# Tells Azure ML what kind of YAML this is.
+#  Docs: https://docs.microsoft.com/en-us/azure/machine-learning/reference-yaml-job-command
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# Name of the experiment where all jobs will end up in the Azure ML dashboard
+experiment_name: pix2seq-train
+
+# What to run
+command: >-
+  echo "machine rank: $NODE_RANK, master addr: $MASTER_ADDR, master port: $MASTER_PORT" && accelerate launch
+  --config_file accelerate_config_multi.yaml
+  --num_machines ${{inputs.num_machines}}
+  --num_processes ${{inputs.num_processes}}
+  --machine_rank $NODE_RANK
+  --main_process_ip $MASTER_ADDR
+  --main_process_port $MASTER_PORT
+  train.py
+  --coco_dir ${{inputs.coco}}
+  --config_file ${{inputs.config_file}}
+  --copy_output_dir False
+  --use_progress_bar False
+inputs:
+  num_machines: 1
+  num_processes: 4
+  coco:
+    type: uri_folder
+    path: azureml:Coco:1
+  config_file: train.yaml
+  # config_file: overfit_eval.yaml
+
+# What code to make available
+code: .
+
+# Where to run it
+environment:
+  build:
+    path: ./environment
+
+distribution:
+  type: pytorch
+  process_count_per_instance: 1
+resources:
+  instance_count: 1
+  shm_size: 640g
+
+compute: azureml:a100-4-pi
+# compute: azureml:h1002-pi
