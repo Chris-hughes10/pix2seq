@@ -1,4 +1,5 @@
-from typing import Optional, Tuple
+from contextlib import nullcontext
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -43,19 +44,32 @@ class SequenceGenerator:
         self,
         model: torch.nn.Module,
         images: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Generate sequences with debug output.
+        greedy: bool = False,
+        return_log_probs: bool = False,
+        training_mode: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor],
+    ]:
+        """Generate sequences with optional greedy decoding and log probability tracking.
 
         Args:
             model: The Pix2Seq model
             images: Input images [B,C,H,W]
+            greedy: If True, use argmax instead of sampling (for baseline in SCST)
+            return_log_probs: If True, return log probabilities for each token
+            training_mode: If True, disable inference_mode to allow gradient flow
 
         Returns:
             pred_seq: Generated sequences [B,L]
             class_logits: Logits for class tokens [B,N,V]
             encoded: Encoded image features
+            log_probs: (only if return_log_probs=True) Log probabilities [B,L]
         """
-        with torch.inference_mode():
+        # Use inference_mode only when not in training mode
+        context = nullcontext() if training_mode else torch.inference_mode()
+
+        with context:
             # Encode all images in batch
             encoded, features = model.encode(images)
             batch_size = encoded.size(0)
@@ -71,7 +85,6 @@ class SequenceGenerator:
             )
 
             # Track class logits and completed sequences
-            # class_logits = []
             completed = torch.zeros(batch_size, dtype=torch.bool, device=device)
             max_objects = (self.max_seq_len - 1) // 5
             stacked_logits = torch.full(
@@ -82,6 +95,11 @@ class SequenceGenerator:
             class_logit_indices = torch.zeros(
                 batch_size, dtype=torch.long, device=device
             )
+
+            # Track log probabilities if requested
+            if return_log_probs:
+                all_log_probs = []
+
             idx = 0
             # Process batches until all sequences complete or max length reached
             while not completed.all() and cur_seq.size(1) < self.max_seq_len:
@@ -120,7 +138,20 @@ class SequenceGenerator:
                     ] = next_token_logits[active_indices]
                     class_logit_indices[active_indices] += 1
 
-                next_tokens = self._sample_next_tokens(constrained_next_token_logits)
+                # Select next tokens (greedy or sampling) with optional log prob tracking
+                if greedy:
+                    next_tokens, token_log_probs = self._select_tokens_greedy(
+                        constrained_next_token_logits,
+                        compute_log_prob=return_log_probs,
+                    )
+                else:
+                    next_tokens, token_log_probs = self._select_tokens_sample(
+                        constrained_next_token_logits,
+                        compute_log_prob=return_log_probs,
+                    )
+
+                if return_log_probs:
+                    all_log_probs.append(token_log_probs)
 
                 # Update sequences
                 cur_seq = torch.cat([cur_seq, next_tokens], dim=1)
@@ -147,10 +178,13 @@ class SequenceGenerator:
                 idx += 1
 
             # Stack class logits if we have any
-            # stacked_logits = torch.stack(class_logits, dim=1) if class_logits else None
-
             max_used = class_logit_indices.max().item()
             stacked_logits = stacked_logits[:, :max_used]
+
+            if return_log_probs:
+                # Stack log probs: [num_steps, B, 1] -> [B, num_steps]
+                log_probs_tensor = torch.cat(all_log_probs, dim=1)  # [B, S]
+                return cur_seq, stacked_logits, features, log_probs_tensor
 
             return cur_seq, stacked_logits, features
 
@@ -238,6 +272,65 @@ class SequenceGenerator:
             )
 
         return sampled_tokens
+
+    def _select_tokens_greedy(
+        self,
+        logits: torch.Tensor,
+        compute_log_prob: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Select tokens using greedy decoding (argmax).
+
+        Args:
+            logits: Unnormalized token probabilities [B,V]
+            compute_log_prob: If True, compute log probability of selected tokens
+
+        Returns:
+            tokens: Selected token indices [B,1]
+            log_probs: Log probabilities [B,1] if compute_log_prob=True, else None
+        """
+        # Greedy selection: take the highest probability token
+        next_tokens = torch.argmax(logits, dim=-1, keepdim=True)  # [B,1]
+
+        log_probs = None
+        if compute_log_prob:
+            # Compute log probability of the selected tokens
+            log_probs_all = torch.log_softmax(logits, dim=-1)  # [B,V]
+            log_probs = log_probs_all.gather(dim=-1, index=next_tokens)  # [B,1]
+
+        return next_tokens, log_probs
+
+    def _select_tokens_sample(
+        self,
+        logits: torch.Tensor,
+        compute_log_prob: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Select tokens using stochastic sampling with top-k/top-p filtering.
+
+        This wraps the existing _sample_next_tokens logic and adds log prob computation.
+
+        Args:
+            logits: Unnormalized token probabilities [B,V]
+            compute_log_prob: If True, compute log probability of selected tokens
+
+        Returns:
+            tokens: Sampled token indices [B,1]
+            log_probs: Log probabilities [B,1] if compute_log_prob=True, else None
+        """
+        # Store original logits for log prob computation before filtering modifies them
+        if compute_log_prob:
+            original_logits = logits.clone()
+
+        # Use existing sampling logic
+        sampled_tokens = self._sample_next_tokens(logits)  # [B,1]
+
+        log_probs = None
+        if compute_log_prob:
+            # Compute log probability using original (unfiltered) logits
+            # This gives the true probability under the model
+            log_probs_all = torch.log_softmax(original_logits, dim=-1)  # [B,V]
+            log_probs = log_probs_all.gather(dim=-1, index=sampled_tokens)  # [B,1]
+
+        return sampled_tokens, log_probs
 
     def _validate_box_coordinates(self, seq: torch.Tensor) -> bool:
         """
