@@ -20,11 +20,12 @@ from model.model import Pix2SeqModel
 from model.modelv2 import LlamaPix2Seq
 from pytorch_accelerated.callbacks import get_default_callbacks
 
-from data.base_dataset import COCOBaseDataset
+from data.base_dataset import COCOBaseDataset, coco80_to_coco91_lookup
 from data.dataset import Pix2SeqDataset
 from data.tokenizer import LabelCorruptionStrategy, TokenProcessor
 from rl import REINFORCETrainer, RecallReward, IoUSupervisionLoss, RLTrainingConfig
 from evaluation.coco_evaluator import COCOMeanAveragePrecision
+from training.trainer import scale_bboxes_to_original_image_size
 
 
 class RLCollator:
@@ -42,6 +43,7 @@ class RLCollator:
         images = torch.stack([x["image"] for x in batch])
         image_ids = torch.tensor([x["image_id"] for x in batch])
         orig_sizes = torch.stack([x["orig_image_size"] for x in batch])
+        unpadded_sizes = torch.stack([x["unpadded_image_size"] for x in batch])
 
         # Keep GT boxes and labels as lists (variable length per image)
         gt_boxes_list = []
@@ -59,6 +61,7 @@ class RLCollator:
             "image": images,
             "image_id": image_ids,
             "orig_image_sizes": orig_sizes,
+            "unpadded_image_sizes": unpadded_sizes,
             "gt_boxes": gt_boxes_list,
             "gt_labels": gt_labels_list,
         }
@@ -193,10 +196,15 @@ def evaluate_model(
     token_processor,
     val_json,
     device,
+    image_size: int,
     batch_size: int = 16,
     top_p: float = 0.4,
 ):
-    """Evaluate model and compute mAP."""
+    """Evaluate model and compute mAP.
+
+    Uses the same box scaling and class conversion as the main training loop
+    to ensure consistent mAP computation.
+    """
     from torch.utils.data import DataLoader
 
     model.eval()
@@ -209,6 +217,9 @@ def evaluate_model(
         num_workers=0,
     )
 
+    # COCO-80 to COCO-91 class ID lookup (reuse existing code)
+    coco80_to_91 = coco80_to_coco91_lookup()
+
     all_predictions = []
 
     with torch.no_grad():
@@ -216,6 +227,7 @@ def evaluate_model(
             images = batch["image"].to(device)
             image_ids = batch["image_id"]
             orig_sizes = batch["orig_image_sizes"]
+            unpadded_sizes = batch["unpadded_image_sizes"]
 
             # Generate predictions
             sequences, class_logits, _ = model.infer(
@@ -233,6 +245,9 @@ def evaluate_model(
                 )
             )
 
+            # Resized image size (model input size)
+            resized_size = torch.tensor([image_size, image_size], device=device)
+
             # Format predictions for COCO evaluation
             for i, (boxes, labels, scores) in enumerate(
                 zip(pred_boxes_list, pred_labels_list, pred_scores_list)
@@ -241,15 +256,33 @@ def evaluate_model(
                     continue
 
                 img_id = image_ids[i].item()
+                orig_size = orig_sizes[i]
+                unpadded_size = unpadded_sizes[i]
 
-                for box, label, score in zip(boxes, labels, scores):
+                # Scale boxes back to original image size (reuse existing code)
+                # Boxes from model are normalized [0,1], need to scale to resized then to original
+                boxes_scaled = boxes.clone()
+                boxes_scaled[:, [0, 2]] *= resized_size[1]  # x coords
+                boxes_scaled[:, [1, 3]] *= resized_size[0]  # y coords
+
+                scaled_boxes = scale_bboxes_to_original_image_size(
+                    boxes_scaled,
+                    resized_size,
+                    orig_size.to(device),
+                    is_padded=True,
+                )
+
+                for box, label, score in zip(scaled_boxes, labels, scores):
+                    # Convert class ID from COCO-80 to COCO-91 (reuse existing lookup)
+                    coco91_label = coco80_to_91[int(label.item())]
+
                     # Convert to COCO format (x, y, w, h)
                     x1, y1, x2, y2 = box.tolist()
                     w, h = x2 - x1, y2 - y1
 
                     all_predictions.append({
                         "image_id": img_id,
-                        "category_id": label.item() + 1,  # COCO uses 1-indexed
+                        "category_id": coco91_label,
                         "bbox": [x1, y1, w, h],
                         "score": score.item(),
                     })
@@ -465,6 +498,7 @@ def train_rl(
                 token_processor=token_processor,
                 val_json=val_json,
                 device=device,
+                image_size=config.data.image_size,
                 batch_size=config.training.eval_batch_size,
                 top_p=config.generation.top_p,
             )
