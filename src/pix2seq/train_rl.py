@@ -373,9 +373,9 @@ FILE_PATH = Path(__file__).resolve().parent
 
 @script
 def train_rl(
+    pretrained_path: str,
     coco_dir: str = "/workspaces/object-detection-rl/data/coco",
     config_file: str = "train_rl.yaml",
-    pretrained_path: str = None,
     use_progress_bar: bool = True,
     eval_frequency: int = 5,
     seed: int = 42,
@@ -383,9 +383,9 @@ def train_rl(
     """Main RL training function with multi-GPU support via Accelerate.
 
     Args:
+        pretrained_path: Path to pretrained MLE checkpoint (required)
         coco_dir: Path to COCO dataset directory
         config_file: Path to config file (relative to config/)
-        pretrained_path: Path to pretrained MLE checkpoint (required)
         use_progress_bar: Whether to show progress bar
         eval_frequency: Evaluate mAP every N epochs
         seed: Random seed for reproducibility
@@ -396,16 +396,6 @@ def train_rl(
 
     # Load config
     config = load_config_from_yaml((FILE_PATH / "config") / config_file)
-
-    # Override pretrained path if provided via command line
-    if pretrained_path:
-        config.model.pretrained_path = pretrained_path
-
-    if not config.model.pretrained_path:
-        raise ValueError(
-            "pretrained_path is required for RL training. "
-            "Please provide a path to a pretrained MLE checkpoint."
-        )
 
     # Setup output directory (only on main process)
     output_dir = Path(config.training.output_dir) / datetime.datetime.now().strftime(
@@ -449,7 +439,7 @@ def train_rl(
 
     # Create model on CPU first, then load pretrained weights
     model = create_model(config, token_processor, llama_model=config.model.llama_model)
-    model = load_pretrained_model(model, config.model.pretrained_path, torch.device("cpu"))
+    model = load_pretrained_model(model, pretrained_path, torch.device("cpu"))
 
     # Create optimizer with lower learning rate for fine-tuning
     optimizer = torch.optim.AdamW(
@@ -528,7 +518,7 @@ def train_rl(
         print("Starting SCST/REINFORCE Training")
         print(f"{'='*60}")
         print(f"Output directory: {output_dir}")
-        print(f"Pretrained model: {config.model.pretrained_path}")
+        print(f"Pretrained model: {pretrained_path}")
         print(f"Learning rate: {config.training.learning_rate}")
         print(f"Batch size per device: {config.training.batch_size}")
         print(f"Number of devices: {accelerator.num_processes}")

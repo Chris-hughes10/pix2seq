@@ -30,8 +30,7 @@ model:
   decoder_output_bias: true
   pad_token_id: 0
   eos_token_id: 1
-  llama_model: true
-  pretrained_path: null  # Path to MLE-pretrained model (required)
+  llama_model: false
 
 training:
   output_dir: "./outputs_rl"
@@ -42,7 +41,7 @@ training:
   eval_batch_size: 50
   gradient_accumulation_steps: 4  # Effective batch size = 64
   gradient_clip_value: null
-  learning_rate: 0.00003  # Lower LR for fine-tuning
+  learning_rate: 0.000006  # Lower LR for fine-tuning
   weight_decay: 0.05
   warmup_epochs: 2
   beta1: 0.9
@@ -51,7 +50,7 @@ training:
   run_eval_freq: 5
   overfit_eval_set: false
   num_visualizations: 5
-  use_wsd_scheduler: false  # Use constant LR or cosine for RL
+  use_wsd_scheduler: true
 
 generation:
   top_p: 0.4
