@@ -5,10 +5,11 @@ Implements Self-Critical Sequence Training as described in:
 - "Tuning Computer Vision Models with Task Rewards" (Pinto et al., 2023)
 
 The training loop structure follows the pattern from simple-ppo.
+Supports multi-GPU training via Hugging Face Accelerate.
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,9 @@ from data.tokenizer import TokenProcessor
 
 from .rewards import RecallReward
 from .iou_loss import IoUSupervisionLoss
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
 
 
 @dataclass
@@ -63,6 +67,7 @@ class REINFORCETrainer:
         iou_loss_fn: Optional[IoUSupervisionLoss] = None,
         config: Optional[RLTrainingConfig] = None,
         device: Optional[torch.device] = None,
+        accelerator: Optional["Accelerator"] = None,
     ):
         """Initialize REINFORCE trainer.
 
@@ -73,7 +78,8 @@ class REINFORCETrainer:
             reward_fn: Reward function (RecallReward)
             iou_loss_fn: Optional IoU supervision loss
             config: Training configuration
-            device: Device to run training on
+            device: Device to run training on (ignored if accelerator provided)
+            accelerator: Optional Accelerator for multi-GPU training
         """
         self.model = model
         self.token_processor = token_processor
@@ -81,11 +87,25 @@ class REINFORCETrainer:
         self.reward_fn = reward_fn
         self.iou_loss_fn = iou_loss_fn
         self.config = config or RLTrainingConfig()
-        self.device = device or next(model.parameters()).device
+        self.accelerator = accelerator
+
+        # Device handling: prefer accelerator if available
+        if accelerator is not None:
+            self.device = accelerator.device
+        elif device is not None:
+            self.device = device
+        else:
+            self.device = next(model.parameters()).device
 
         # Training stats
         self.global_step = 0
         self.stats_history: List[Dict[str, float]] = []
+
+    def _get_unwrapped_model(self):
+        """Get the unwrapped model for inference (handles DDP wrapping)."""
+        if self.accelerator is not None:
+            return self.accelerator.unwrap_model(self.model)
+        return self.model
 
     def collect_samples(
         self,
@@ -112,8 +132,11 @@ class REINFORCETrainer:
         was_training = self.model.training
         self.model.eval()
 
+        # Get unwrapped model for inference (handles DDP wrapping)
+        unwrapped_model = self._get_unwrapped_model()
+
         # Sample sequences with log probabilities
-        sampled_seqs, sampled_logits, _, sampled_log_probs = self.model.infer(
+        sampled_seqs, sampled_logits, _, sampled_log_probs = unwrapped_model.infer(
             images=images,
             temperature=self.config.temperature,
             top_k=self.config.top_k,
@@ -125,7 +148,7 @@ class REINFORCETrainer:
 
         # Compute baseline sequences (greedy, no gradients needed)
         with torch.no_grad():
-            baseline_seqs, baseline_logits, _ = self.model.infer(
+            baseline_seqs, baseline_logits, _ = unwrapped_model.infer(
                 images=images,
                 greedy=True,
                 return_log_probs=False,
@@ -333,15 +356,25 @@ class REINFORCETrainer:
         # Total loss
         total_loss = rl_loss + self.config.iou_loss_weight * iou_loss
 
-        # Optimize
+        # Optimize - use accelerator if available for multi-GPU support
         self.optimizer.zero_grad()
-        total_loss.backward()
+
+        if self.accelerator is not None:
+            self.accelerator.backward(total_loss)
+        else:
+            total_loss.backward()
 
         if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.max_grad_norm,
-            )
+            if self.accelerator is not None:
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm,
+                )
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm,
+                )
 
         self.optimizer.step()
 

@@ -38,6 +38,7 @@ Key insight from the paper: **mAP correlates with recall** when the model ranks 
 | `rl/rewards.py` | Per-image recall reward computation |
 | `rl/iou_loss.py` | Supervised IoU loss for confidence prediction |
 | `rl/reinforce.py` | REINFORCE trainer with self-critical baseline |
+| `train_rl.py` | RL training script with multi-GPU support |
 | `config/train_rl.yaml` | RL training configuration |
 | `tests/test_rl.py` | Unit tests |
 
@@ -108,7 +109,32 @@ class REINFORCETrainer:
 
 ## Usage
 
-### Basic Usage
+### Training Script
+
+The recommended way to run RL training is via the `train_rl.py` script:
+
+```bash
+# Single GPU
+python train_rl.py --pretrained_path /path/to/mle_checkpoint.pt
+
+# Multi-GPU with Accelerate
+accelerate launch train_rl.py --pretrained_path /path/to/mle_checkpoint.pt
+
+# With custom config
+python train_rl.py \
+    --pretrained_path /path/to/checkpoint.pt \
+    --config_file train_rl.yaml \
+    --coco_dir /path/to/coco \
+    --eval_frequency 5
+```
+
+The script supports:
+- **Multi-GPU training** via Hugging Face Accelerate
+- **MLflow/AzureML logging** (automatically enabled when `MLFLOW_TRACKING_URI` is set)
+- **Periodic mAP evaluation** during training
+- **Checkpointing** of best and final models
+
+### Programmatic Usage
 
 ```python
 from rl import REINFORCETrainer, RecallReward, IoUSupervisionLoss, RLTrainingConfig
