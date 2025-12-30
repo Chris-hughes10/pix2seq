@@ -281,7 +281,7 @@ class TokenProcessor:
             torch.where(
                 is_fake.unsqueeze(-1), # Expand fake mask to match box dimensions [B,N,1] -> [B,N,4]
                 torch.full_like(boxes, self.noise_bbox_weight, dtype=torch.float32), # Fake objects get specified weights for coordinates
-                torch.ones_like(boxes, dtype=torch.float32), torch.ones_like(boxes, dtype=torch.float32),  # Real objects get weight 1.0 (fully learn coordinates)
+                torch.ones_like(boxes, dtype=torch.float32),  # Real objects get weight 1.0 (fully learn coordinates)
             ),
         )
 

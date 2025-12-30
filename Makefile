@@ -48,7 +48,7 @@ isolate-run: check-arg-exp check-exp-exists
 	@echo "Making expierment dir: '$(run_dir)'"
 	@mkdir -p "$(run_dir)"
 	@cp -r  $(CODE_PATH)/$(exp) $(run_dir)
-	@cp -r  $(CODE_PATH)/common $(run_dir)
+# 	@cp -r  $(CODE_PATH)/common $(run_dir)
 	@echo "Experiment isolated in: '$(run_dir)'"
 
 job: file=azure-ml-job.yaml
