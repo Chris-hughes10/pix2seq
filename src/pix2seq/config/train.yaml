@@ -34,8 +34,10 @@ training:
   predictions_dir: "predictions"
   num_epochs: 300
   max_steps: null
-  batch_size: 64
-  eval_batch_size: 50
+  # batch_size: 64
+  batch_size: 112
+  # eval_batch_size: 50
+  eval_batch_size: 100
   gradient_accumulation_steps: 1
   gradient_clip_value: null
   learning_rate: 0.0003

@@ -17,6 +17,6 @@ dependencies:
     - albumentations==1.4.22
     - timm
     - seaborn
-    - pytorch-accelerated==0.1.54
+    - pytorch-accelerated==0.1.55
     - torch==2.6
 
