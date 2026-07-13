@@ -51,6 +51,8 @@ class Pix2SeqModel(nn.Module):
         base_vocab_shift: int = 10,  # Base vocab shift
         num_quantization_bins: int = 1000,  # Quantization bins
         token_processor: TokenProcessor = None,
+        vit_model_name: str = "vit_base_patch16_384",
+        vit_pretrained: bool = True,
     ):
         super().__init__()
 
@@ -72,8 +74,8 @@ class Pix2SeqModel(nn.Module):
 
         # Vision Transformer encoder - matching TF configuration
         self.vit = timm.create_model(
-            "vit_base_patch16_384",
-            pretrained=True,
+            vit_model_name,
+            pretrained=vit_pretrained,
             img_size=image_size,
             patch_size=patch_size,
             num_classes=0,
@@ -158,8 +160,13 @@ class Pix2SeqModel(nn.Module):
             if self.output_proj.bias is not None:
                 nn.init.zeros_(self.output_proj.bias)
 
-    def forward(self, images, tgt, tgt_padding_mask=None):
+    def forward(self, images, tgt, tgt_padding_mask=None, num_tgt_per_image: int = 1):
         encoded, _ = self.encode(images)
+        if num_tgt_per_image > 1:
+            # Score several target sequences per image (e.g. RL re-scoring of K
+            # sampled sequences) while encoding each image only once. tgt rows
+            # must be grouped per image in repeat_interleave order.
+            encoded = encoded.repeat_interleave(num_tgt_per_image, dim=0)
         return self.decode(tgt, encoded, tgt_padding_mask=tgt_padding_mask)
 
     def encode(self, images, return_features=False):
@@ -239,7 +246,7 @@ class Pix2SeqModel(nn.Module):
         top_p: float = 0.4,
         greedy: bool = False,
         return_log_probs: bool = False,
-        training_mode: bool = False,
+        num_samples: int = 1,
     ):
         """Run inference using the improved sequence generator.
 
@@ -251,7 +258,8 @@ class Pix2SeqModel(nn.Module):
             top_p: Cumulative probability threshold for nucleus sampling
             greedy: If True, use argmax instead of sampling (for SCST baseline)
             return_log_probs: If True, return log probabilities for each token
-            training_mode: If True, disable inference_mode to allow gradient flow
+            num_samples: Number of sequences to sample per image (outputs grouped
+                per image in repeat_interleave order)
 
         Returns:
             If return_log_probs=False: (sequences, class_logits, features)
@@ -271,15 +279,18 @@ class Pix2SeqModel(nn.Module):
             max_seq_len=max_seq_len,
         )
 
-        result = generator.generate(
-            self,
-            images,
-            greedy=greedy,
-            return_log_probs=return_log_probs,
-            training_mode=training_mode,
-        )
-
-        self.clear_decoder_caches()
+        try:
+            result = generator.generate(
+                self,
+                images,
+                greedy=greedy,
+                return_log_probs=return_log_probs,
+                num_samples=num_samples,
+            )
+        finally:
+            # Always drop the KV cache buffers: stale ones would be picked up by
+            # DDP's buffer broadcast on the next wrapped forward pass
+            self.clear_decoder_caches()
 
         return result
 

@@ -1,4 +1,3 @@
-from contextlib import nullcontext
 from typing import Optional, Tuple, Union
 
 import torch
@@ -46,7 +45,7 @@ class SequenceGenerator:
         images: torch.Tensor,
         greedy: bool = False,
         return_log_probs: bool = False,
-        training_mode: bool = False,
+        num_samples: int = 1,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor],
@@ -58,20 +57,24 @@ class SequenceGenerator:
             images: Input images [B,C,H,W]
             greedy: If True, use argmax instead of sampling (for baseline in SCST)
             return_log_probs: If True, return log probabilities for each token
-            training_mode: If True, disable inference_mode to allow gradient flow
+            num_samples: Number of sequences to sample per image. Images are encoded
+                once and the encoded features repeated, so outputs are grouped as
+                [img0_s0, img0_s1, ..., img1_s0, ...] (repeat_interleave order)
 
         Returns:
-            pred_seq: Generated sequences [B,L]
-            class_logits: Logits for class tokens [B,N,V]
+            pred_seq: Generated sequences [B*num_samples,L]
+            class_logits: Logits for class tokens [B*num_samples,N,V]
             encoded: Encoded image features
-            log_probs: (only if return_log_probs=True) Log probabilities [B,L]
+            log_probs: (only if return_log_probs=True) Log probabilities of each
+                generated token (BOS excluded) [B*num_samples,L-1]
         """
-        # Use inference_mode only when not in training mode
-        context = nullcontext() if training_mode else torch.inference_mode()
-
-        with context:
+        with torch.inference_mode():
             # Encode all images in batch
             encoded, features = model.encode(images)
+            if num_samples > 1:
+                encoded = encoded.repeat_interleave(num_samples, dim=0)
+                if features is not None:
+                    features = features.repeat_interleave(num_samples, dim=0)
             batch_size = encoded.size(0)
             device = encoded.device
             self.token_masks.to(device)
@@ -182,8 +185,8 @@ class SequenceGenerator:
             stacked_logits = stacked_logits[:, :max_used]
 
             if return_log_probs:
-                # Stack log probs: [num_steps, B, 1] -> [B, num_steps]
-                log_probs_tensor = torch.cat(all_log_probs, dim=1)  # [B, S]
+                # Concatenate per-step log probs: list of [B,1] -> [B, num_steps]
+                log_probs_tensor = torch.cat(all_log_probs, dim=1)  # [B, S-1]
                 return cur_seq, stacked_logits, features, log_probs_tensor
 
             return cur_seq, stacked_logits, features
@@ -201,22 +204,21 @@ class SequenceGenerator:
             return 0
         return (seq_len - 1) % 5
 
-    def _sample_next_tokens(self, logits: torch.Tensor) -> torch.Tensor:
-        """Sample next tokens using temperature and top-k/top-p, handling FAKE_CLASS_TOKEN.
+    def _filter_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply top-k/top-p filtering to logits (out-of-place).
 
         Args:
             logits: Unnormalized token probabilities [B,V]
 
         Returns:
-            Sampled token indices [B,1]
+            Filtered logits [B,V] with removed tokens set to -inf
         """
-
         if self.top_k > 0:
             # Apply top-k filtering
             indices_to_remove = (
                 logits < torch.topk(logits, self.top_k)[0][..., -1, None]
             )
-            logits[indices_to_remove] = float("-inf")
+            logits = logits.masked_fill(indices_to_remove, float("-inf"))
 
         if self.top_p > 0:
             # Apply nucleus sampling
@@ -232,46 +234,13 @@ class SequenceGenerator:
             ].clone()
             sorted_indices_to_remove[..., 0] = 0
 
-            # Apply the mask to the logits
-            for batch_idx in range(logits.size(0)):
-                indices_to_remove = sorted_indices_to_remove[batch_idx].scatter(
-                    0, sorted_indices[batch_idx], sorted_indices_to_remove[batch_idx]
-                )
-                logits[batch_idx][indices_to_remove] = float("-inf")
-
-        # Sample from filtered distribution
-        probs = torch.softmax(logits, dim=-1)
-        sampled_tokens = torch.multinomial(probs, num_samples=1)
-
-        # Check for FAKE_CLASS_TOKEN and replace with next best real class
-        fake_token_mask = sampled_tokens == self.token_processor.FAKE_CLASS_TOKEN
-        if fake_token_mask.any():
-            # Create class token mask
-            class_range = torch.arange(
-                self.token_processor.BASE_VOCAB_SHIFT,
-                self.token_processor.FAKE_CLASS_TOKEN,
-                device=logits.device,
+            # Map the removal mask from sorted order back to vocab order
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                1, sorted_indices, sorted_indices_to_remove
             )
-            class_mask = torch.zeros_like(logits, dtype=torch.bool)
-            class_mask[:, class_range] = True
+            logits = logits.masked_fill(indices_to_remove, float("-inf"))
 
-            # Mask out FAKE_CLASS_TOKEN and invalid tokens
-            valid_logits = logits.clone()
-            valid_logits[:, self.token_processor.FAKE_CLASS_TOKEN] = float("-inf")
-            valid_logits = torch.where(
-                class_mask, valid_logits, torch.tensor(float("-inf")).to(logits.device)
-            )
-
-            # Get best valid class token
-            replacement_probs = torch.softmax(valid_logits, dim=-1)
-            replacement_tokens = torch.multinomial(replacement_probs, num_samples=1)
-
-            # Replace FAKE_CLASS_TOKEN with best valid class
-            sampled_tokens = torch.where(
-                fake_token_mask, replacement_tokens, sampled_tokens
-            )
-
-        return sampled_tokens
+        return logits
 
     def _select_tokens_greedy(
         self,
@@ -306,8 +275,6 @@ class SequenceGenerator:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Select tokens using stochastic sampling with top-k/top-p filtering.
 
-        This wraps the existing _sample_next_tokens logic and adds log prob computation.
-
         Args:
             logits: Unnormalized token probabilities [B,V]
             compute_log_prob: If True, compute log probability of selected tokens
@@ -316,18 +283,37 @@ class SequenceGenerator:
             tokens: Sampled token indices [B,1]
             log_probs: Log probabilities [B,1] if compute_log_prob=True, else None
         """
-        # Store original logits for log prob computation before filtering modifies them
-        if compute_log_prob:
-            original_logits = logits.clone()
+        filtered_logits = self._filter_logits(logits)
 
-        # Use existing sampling logic
-        sampled_tokens = self._sample_next_tokens(logits)  # [B,1]
+        probs = torch.softmax(filtered_logits, dim=-1)
+        sampled_tokens = torch.multinomial(probs, num_samples=1)  # [B,1]
+
+        # FAKE_CLASS_TOKEN can only be sampled when generation runs without the
+        # class-position constraint mask (position_masks[4] excludes it); resample
+        # a real class in that case. Unreachable in constrained generation.
+        fake_token_mask = sampled_tokens == self.token_processor.FAKE_CLASS_TOKEN
+        if fake_token_mask.any():
+            valid_logits = filtered_logits.clone()
+            valid_logits[:, self.token_processor.FAKE_CLASS_TOKEN] = float("-inf")
+            class_mask = torch.zeros_like(valid_logits, dtype=torch.bool)
+            class_mask[
+                :,
+                self.token_processor.BASE_VOCAB_SHIFT : self.token_processor.FAKE_CLASS_TOKEN,
+            ] = True
+            valid_logits = valid_logits.masked_fill(~class_mask, float("-inf"))
+
+            replacement_tokens = torch.multinomial(
+                torch.softmax(valid_logits, dim=-1), num_samples=1
+            )
+            sampled_tokens = torch.where(
+                fake_token_mask, replacement_tokens, sampled_tokens
+            )
 
         log_probs = None
         if compute_log_prob:
-            # Compute log probability using original (unfiltered) logits
-            # This gives the true probability under the model
-            log_probs_all = torch.log_softmax(original_logits, dim=-1)  # [B,V]
+            # Log probability under the distribution that was actually sampled from
+            # (post filtering). Using anything else would bias the policy gradient.
+            log_probs_all = torch.log_softmax(filtered_logits, dim=-1)  # [B,V]
             log_probs = log_probs_all.gather(dim=-1, index=sampled_tokens)  # [B,1]
 
         return sampled_tokens, log_probs
@@ -417,40 +403,41 @@ class TokenMaskCache:
     def get_allowed_tokens(
         self, pattern_pos: int, cur_seq: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Get allowed tokens using cached masks where possible."""
+        """Get allowed tokens using cached masks where possible.
+
+        Returns a [V] mask for static positions (0, 1, 4) and a per-sample
+        [B, V] mask for the dynamic ymax/xmax positions (2, 3), where each
+        sample is constrained to coordinates strictly greater than its own
+        ymin/xmin token.
+        """
         # Use pre-computed masks for static positions
         if pattern_pos in (0, 1, 4):
             return self.position_masks[pattern_pos]
 
-        # Dynamic constraints for ymax/xmax need sequence context
+        # Dynamic constraints for ymax (2) / xmax (3): the reference ymin/xmin
+        # token is two positions back in the sequence
         device = cur_seq.device
-        allowed = torch.zeros(
-            self.token_processor.vocab_size, dtype=torch.bool, device=device
+        min_values = cur_seq[:, -2] - self.token_processor.coord_vocab_shift  # [B]
+
+        # Clamp so at least the top bin stays allowed when ymin/xmin was sampled
+        # at the top bin (otherwise the allowed set would be empty -> NaN softmax).
+        # The resulting degenerate box is filtered during post-processing.
+        min_values = min_values.clamp(
+            max=self.token_processor.quantization_bins - 2
         )
 
-        if pattern_pos == 2:  # ymax
-            seq_len = cur_seq.size(1)
-            ymin_values = (
-                cur_seq[:, seq_len - 2] - self.token_processor.coord_vocab_shift
-            )
+        coord_mask = self.coord_range[None, :] > min_values[:, None]  # [B, bins]
 
-            # Vectorized comparison for allowed coordinates
-            coord_mask = self.coord_range[None, :] > ymin_values[:, None]
-            start_idx = self.token_processor.coord_vocab_shift
-            for i, mask in enumerate(coord_mask):
-                allowed[start_idx : start_idx + len(mask)][mask] = True
-
-        elif pattern_pos == 3:  # xmax
-            seq_len = cur_seq.size(1)
-            xmin_values = (
-                cur_seq[:, seq_len - 2] - self.token_processor.coord_vocab_shift
-            )
-
-            # Vectorized comparison for allowed coordinates
-            coord_mask = self.coord_range[None, :] > xmin_values[:, None]
-            start_idx = self.token_processor.coord_vocab_shift
-            for i, mask in enumerate(coord_mask):
-                allowed[start_idx : start_idx + len(mask)][mask] = True
+        allowed = torch.zeros(
+            cur_seq.size(0),
+            self.token_processor.vocab_size,
+            dtype=torch.bool,
+            device=device,
+        )
+        start_idx = self.token_processor.coord_vocab_shift
+        allowed[:, start_idx : start_idx + self.token_processor.quantization_bins] = (
+            coord_mask
+        )
 
         return allowed
 
