@@ -1,4 +1,4 @@
-# Azure ML Job Configuration for SCST/REINFORCE Training
+# Azure ML Job Configuration for REINFORCE Training
 # Docs: https://docs.microsoft.com/en-us/azure/machine-learning/reference-yaml-job-command
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
@@ -6,15 +6,14 @@ $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 experiment_name: pix2seq-rl-training
 
 # Display name for this specific run
-display_name: scst-finetune
+display_name: reinforce-finetune
 
-# What to run
+# What to run (eval frequency and RL settings live in config/train_rl.yaml)
 command: >-
   python src/pix2seq/train_rl.py
   --coco_dir ${{inputs.coco_data}}
   --config_file train_rl.yaml
   --pretrained_path ${{inputs.pretrained_model}}/checkpoint.pt
-  --eval_frequency 5
 
 inputs:
   coco_data:

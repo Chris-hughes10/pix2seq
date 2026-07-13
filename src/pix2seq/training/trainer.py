@@ -42,6 +42,59 @@ def scale_bboxes_to_original_image_size(
     return scaled_boxes
 
 
+def format_predictions_for_evaluation(
+    boxes_list,
+    labels_list,
+    scores_list,
+    image_ids,
+    original_sizes,
+    resized_sizes,
+    predictions_list,
+):
+    """Format normalized model predictions for evaluation.
+
+    Boxes are expected as normalized [0,1] XYXY (the output of
+    ``post_process_sequences``); they are scaled back to original image
+    coordinates here. Appends [N, 7] tensors of
+    [xmin, ymin, xmax, ymax, score, class_id, image_id] to predictions_list.
+    """
+    for boxes, labels, scores, img_id, orig_size, res_size in zip(
+        boxes_list,
+        labels_list,
+        scores_list,
+        image_ids,
+        original_sizes,
+        resized_sizes,
+    ):
+        if scores is not None:
+            if len(scores) != len(boxes):
+                warnings.warn(
+                    f"Mismatched scores and boxes: {len(scores)} scores but {len(boxes)} boxes"
+                )
+                continue
+
+            scaled_boxes = scale_bboxes_to_original_image_size(
+                boxes, res_size, orig_size, is_padded=True
+            )
+
+            # Stack predictions in expected format
+            predictions = torch.cat(
+                [
+                    scaled_boxes,  # [N, 4] - xmin, ymin, xmax, ymax
+                    scores.unsqueeze(-1),  # [N, 1] - score
+                    labels.unsqueeze(-1),  # [N, 1] - class_id
+                    torch.full(
+                        (len(boxes), 1),
+                        img_id.item(),
+                        device=boxes.device,
+                    ),  # [N, 1] - image_id
+                ],
+                dim=1,
+            )  # [N, 7]
+
+            predictions_list.append(predictions)
+
+
 class Pix2SeqTrainer(Trainer):
     """PyTorch trainer for Pix2Seq with optimal integration with parent class."""
 
@@ -230,38 +283,12 @@ class Pix2SeqTrainer(Trainer):
         predictions_list,
     ):
         """Format model predictions for evaluation."""
-        for boxes, labels, scores, img_id, orig_size, res_size in zip(
+        format_predictions_for_evaluation(
             boxes_list,
             labels_list,
             scores_list,
             image_ids,
             original_sizes,
             resized_sizes,
-        ):
-            if scores is not None:
-                if len(scores) != len(boxes):
-                    warnings.warn(
-                        f"Mismatched scores and boxes: {len(scores)} scores but {len(boxes)} boxes"
-                    )
-                    continue
-
-                scaled_boxes = scale_bboxes_to_original_image_size(
-                    boxes, res_size, orig_size, is_padded=True
-                )
-
-                # Stack predictions in expected format
-                predictions = torch.cat(
-                    [
-                        scaled_boxes,  # [N, 4] - xmin, ymin, xmax, ymax
-                        scores.unsqueeze(-1),  # [N, 1] - score
-                        labels.unsqueeze(-1),  # [N, 1] - class_id
-                        torch.full(
-                            (len(boxes), 1),
-                            img_id.item(),
-                            device=boxes.device,
-                        ),  # [N, 1] - image_id
-                    ],
-                    dim=1,
-                )  # [N, 7]
-
-                predictions_list.append(predictions)
+            predictions_list,
+        )

@@ -1,9 +1,12 @@
-"""SCST/REINFORCE training script for Pix2Seq.
+"""REINFORCE training script for Pix2Seq.
 
-This script performs RL fine-tuning on a pretrained Pix2Seq model using
-Self-Critical Sequence Training (SCST) to optimize directly for recall.
+Fine-tunes a pretrained (MLE) Pix2Seq model with policy gradients on a recall
+reward plus IoU-supervised confidences, following "Tuning Computer Vision
+Models with Task Rewards" (arXiv:2302.08242).
 
-Supports multi-GPU training via Hugging Face Accelerate.
+Supports multi-GPU training via Hugging Face Accelerate: rollouts run on the
+unwrapped model without gradients, while the teacher-forced re-scoring forward
+pass runs through the DDP-wrapped model so gradients synchronise.
 
 Usage:
     # Single GPU
@@ -15,6 +18,7 @@ Usage:
 
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 from typing import Dict, List
@@ -27,12 +31,11 @@ from func_to_script import load_config_from_yaml, script
 from model.model import Pix2SeqModel
 from model.modelv2 import LlamaPix2Seq
 
-from data.base_dataset import COCOBaseDataset, coco80_to_coco91_lookup
+from data.base_dataset import COCOBaseDataset
 from data.dataset import Pix2SeqDataset
 from data.tokenizer import LabelCorruptionStrategy, TokenProcessor
-from rl import REINFORCETrainer, RecallReward, IoUSupervisionLoss, RLTrainingConfig
-from evaluation.coco_evaluator import COCOMeanAveragePrecision
-from training.trainer import scale_bboxes_to_original_image_size
+from rl import IoUSupervisionLoss, RecallReward, REINFORCETrainer, RLTrainingConfig
+from rl.evaluation import evaluate_map
 from utils import AzureMLLogger
 
 
@@ -241,115 +244,29 @@ def load_pretrained_model(model, checkpoint_path: str, device: torch.device):
     return model
 
 
-def evaluate_model(
-    model,
-    eval_dataset,
-    token_processor,
-    val_json,
-    device,
-    image_size: int,
-    batch_size: int = 16,
-    top_p: float = 0.4,
-    accelerator: Accelerator = None,
-):
-    """Evaluate model and compute mAP.
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_updates: int,
+    schedule: str = "constant",
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linear warmup followed by a constant or cosine schedule.
 
-    Uses the same box scaling and class conversion as the main training loop
-    to ensure consistent mAP computation.
-
-    Note: When using multi-GPU, this should only be called on the main process.
+    Steps are counted in optimizer updates (i.e. after gradient accumulation).
     """
-    from torch.utils.data import DataLoader
+    if schedule not in ("constant", "cosine"):
+        raise ValueError(f"Unknown lr_schedule: {schedule}")
 
-    # Get unwrapped model for inference
-    if accelerator is not None:
-        unwrapped_model = accelerator.unwrap_model(model)
-    else:
-        unwrapped_model = model
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return (step + 1) / warmup_steps
+        if schedule == "constant":
+            return 1.0
+        progress = (step - warmup_steps) / max(1, total_updates - warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    unwrapped_model.eval()
-    collator = RLCollator(token_processor)
-    eval_loader = DataLoader(
-        eval_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=0,
-    )
-
-    # COCO-80 to COCO-91 class ID lookup (reuse existing code)
-    coco80_to_91 = coco80_to_coco91_lookup()
-
-    all_predictions = []
-
-    with torch.no_grad():
-        for batch in eval_loader:
-            images = batch["image"].to(device)
-            image_ids = batch["image_id"]
-            orig_sizes = batch["orig_image_sizes"]
-
-            # Generate predictions
-            sequences, class_logits, _ = unwrapped_model.infer(
-                images=images,
-                greedy=True,  # Use greedy for evaluation
-                top_p=top_p,
-            )
-
-            # Decode predictions
-            pred_boxes_list, pred_labels_list, pred_scores_list = (
-                token_processor.post_process_sequences(
-                    sequences=sequences,
-                    class_logits=class_logits,
-                    confidence_threshold=0.05,
-                )
-            )
-
-            # Resized image size (model input size)
-            resized_size = torch.tensor([image_size, image_size], device=device)
-
-            # Format predictions for COCO evaluation
-            for i, (boxes, labels, scores) in enumerate(
-                zip(pred_boxes_list, pred_labels_list, pred_scores_list)
-            ):
-                if scores is None or len(boxes) == 0:
-                    continue
-
-                img_id = image_ids[i].item()
-                orig_size = orig_sizes[i]
-
-                # Scale boxes back to original image size (reuse existing code)
-                # Boxes from model are normalized [0,1], need to scale to resized then to original
-                boxes_scaled = boxes.clone()
-                boxes_scaled[:, [0, 2]] *= resized_size[1]  # x coords
-                boxes_scaled[:, [1, 3]] *= resized_size[0]  # y coords
-
-                scaled_boxes = scale_bboxes_to_original_image_size(
-                    boxes_scaled,
-                    resized_size,
-                    orig_size.to(device),
-                    is_padded=True,
-                )
-
-                for box, label, score in zip(scaled_boxes, labels, scores):
-                    # Convert class ID from COCO-80 to COCO-91 (reuse existing lookup)
-                    coco91_label = coco80_to_91[int(label.item())]
-
-                    # Convert to COCO format (x, y, w, h)
-                    x1, y1, x2, y2 = box.tolist()
-                    w, h = x2 - x1, y2 - y1
-
-                    all_predictions.append({
-                        "image_id": img_id,
-                        "category_id": coco91_label,
-                        "bbox": [x1, y1, w, h],
-                        "score": score.item(),
-                    })
-
-    # Compute mAP
-    evaluator = COCOMeanAveragePrecision(verbose=False)
-    mAP = evaluator.compute(val_json, all_predictions)
-
-    return mAP
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def setup_output_dir(config, output_dir):
@@ -376,8 +293,6 @@ def train_rl(
     pretrained_path: str,
     coco_dir: str = "/workspaces/object-detection-rl/data/coco",
     config_file: str = "train_rl.yaml",
-    use_progress_bar: bool = True,
-    eval_frequency: int = 5,
     seed: int = 42,
 ):
     """Main RL training function with multi-GPU support via Accelerate.
@@ -386,16 +301,17 @@ def train_rl(
         pretrained_path: Path to pretrained MLE checkpoint (required)
         coco_dir: Path to COCO dataset directory
         config_file: Path to config file (relative to config/)
-        use_progress_bar: Whether to show progress bar
-        eval_frequency: Evaluate mAP every N epochs
         seed: Random seed for reproducibility
     """
-    # Initialize Accelerator for multi-GPU support
-    accelerator = Accelerator()
-    set_seed(seed)
-
     # Load config
     config = load_config_from_yaml((FILE_PATH / "config") / config_file)
+
+    # Initialize Accelerator: gradient accumulation is handled by
+    # accelerator.accumulate() in the training loop
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+    )
+    set_seed(seed)
 
     # Setup output directory (only on main process)
     output_dir = Path(config.training.output_dir) / datetime.datetime.now().strftime(
@@ -463,10 +379,26 @@ def train_rl(
         drop_last=True,
     )
 
-    # Prepare model, optimizer, and dataloader with Accelerator
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    # LR scheduler stepped per optimizer update (after accumulation)
+    updates_per_epoch = math.ceil(
+        len(train_loader)
+        / (config.training.gradient_accumulation_steps * accelerator.num_processes)
+    )
+    total_updates = updates_per_epoch * config.training.num_epochs
+    lr_scheduler = build_lr_scheduler(
+        optimizer,
+        warmup_steps=config.training.warmup_steps,
+        total_updates=total_updates,
+        schedule=config.training.lr_schedule,
+    )
 
-    # Create RL components (after accelerator.prepare so we use correct device)
+    # Prepare with Accelerator. Prepared optimizer/scheduler automatically skip
+    # steps during gradient accumulation
+    model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_loader, lr_scheduler
+    )
+
+    # Create RL components
     reward_fn = RecallReward(
         token_processor=token_processor,
         iou_thresholds=config.rl.reward.iou_thresholds,
@@ -480,20 +412,22 @@ def train_rl(
 
     # Create RL trainer config
     rl_config = RLTrainingConfig(
-        baseline=config.rl.baseline,
+        algorithm=config.rl.algorithm,
+        advantage_type=config.rl.advantage_type,
+        num_samples_per_image=config.rl.num_samples_per_image,
+        temperature=config.rl.sampling.temperature,
+        top_k=config.rl.sampling.top_k,
+        top_p=config.rl.sampling.top_p,
         iou_loss_weight=config.rl.iou_supervision.weight if iou_loss_fn else 0.0,
         normalize_advantages=config.rl.normalize_advantages,
         max_grad_norm=config.rl.max_grad_norm,
-        temperature=config.generation.temperature,
-        top_k=config.generation.top_k,
-        top_p=config.generation.top_p,
     )
 
-    # Create trainer with accelerator for multi-GPU support
+    # The trainer computes losses; this loop owns backward/clip/step. Pass the
+    # wrapped model so the re-scoring forward synchronises gradients under DDP
     trainer = REINFORCETrainer(
         model=model,
         token_processor=token_processor,
-        optimizer=optimizer,
         reward_fn=reward_fn,
         iou_loss_fn=iou_loss_fn,
         config=rl_config,
@@ -505,8 +439,9 @@ def train_rl(
 
     # Set MLflow tags with run configuration
     logger.set_tags({
-        "algorithm": "SCST/REINFORCE",
-        "baseline": config.rl.baseline,
+        "algorithm": config.rl.algorithm,
+        "advantage_type": config.rl.advantage_type,
+        "num_samples_per_image": str(config.rl.num_samples_per_image),
         "learning_rate": str(config.training.learning_rate),
         "batch_size": str(config.training.batch_size),
         "num_devices": str(accelerator.num_processes),
@@ -514,17 +449,24 @@ def train_rl(
 
     # Training info (only print on main process)
     if accelerator.is_main_process:
+        effective_batch = (
+            config.training.batch_size
+            * accelerator.num_processes
+            * config.training.gradient_accumulation_steps
+        )
         print(f"\n{'='*60}")
-        print("Starting SCST/REINFORCE Training")
+        print("Starting REINFORCE Training")
         print(f"{'='*60}")
         print(f"Output directory: {output_dir}")
         print(f"Pretrained model: {pretrained_path}")
         print(f"Learning rate: {config.training.learning_rate}")
         print(f"Batch size per device: {config.training.batch_size}")
+        print(f"Gradient accumulation steps: {config.training.gradient_accumulation_steps}")
         print(f"Number of devices: {accelerator.num_processes}")
-        print(f"Effective batch size: {config.training.batch_size * accelerator.num_processes}")
+        print(f"Effective batch size (images per update): {effective_batch}")
+        print(f"Samples per image (K): {config.rl.num_samples_per_image}")
+        print(f"Advantage type: {config.rl.advantage_type}")
         print(f"Epochs: {config.training.num_epochs}")
-        print(f"Baseline: {config.rl.baseline}")
         print(f"{'='*60}\n")
 
     best_mAP = -1
@@ -534,14 +476,28 @@ def train_rl(
         model.train()
         epoch_stats = []
 
-        for batch_idx, batch in enumerate(train_loader):
+        for batch in train_loader:
             # Accelerator handles device placement for tensors in batch["image"]
             # But we need to manually move the list items (gt_boxes, gt_labels)
             batch["gt_boxes"] = [b.to(accelerator.device) for b in batch["gt_boxes"]]
-            batch["gt_labels"] = [l.to(accelerator.device) for l in batch["gt_labels"]]
+            batch["gt_labels"] = [
+                labels.to(accelerator.device) for labels in batch["gt_labels"]
+            ]
 
-            # Training step
-            stats = trainer.train_step(batch)
+            with accelerator.accumulate(model):
+                loss, stats = trainer.compute_losses(batch)
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients and rl_config.max_grad_norm > 0:
+                    accelerator.clip_grad_norm_(
+                        model.parameters(), rl_config.max_grad_norm
+                    )
+
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            stats["lr"] = lr_scheduler.get_last_lr()[0]
             epoch_stats.append(stats)
 
             # Log
@@ -560,20 +516,21 @@ def train_rl(
             print(f"  Avg Baseline: {avg_stats['reward/baseline_mean']:.4f}")
 
         # Evaluate periodically (only on main process to avoid duplicate work)
-        if (epoch + 1) % eval_frequency == 0:
+        if (epoch + 1) % config.evaluation.eval_frequency == 0:
             accelerator.wait_for_everyone()
 
             if accelerator.is_main_process:
                 print(f"\nEvaluating at epoch {epoch + 1}...")
-                mAP = evaluate_model(
+                mAP = evaluate_map(
                     model=model,
                     eval_dataset=eval_dataset,
+                    collate_fn=collator,
                     token_processor=token_processor,
                     val_json=val_json,
                     device=accelerator.device,
-                    image_size=config.data.image_size,
+                    max_seq_len=token_processor.max_seq_len,
                     batch_size=config.training.eval_batch_size,
-                    top_p=config.generation.top_p,
+                    confidence_threshold=config.evaluation.confidence_threshold,
                     accelerator=accelerator,
                 )
                 print(f"  mAP: {mAP:.4f}")
@@ -590,6 +547,7 @@ def train_rl(
                             "epoch": epoch + 1,
                             "model_state_dict": unwrapped_model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": lr_scheduler.state_dict(),
                             "mAP": mAP,
                         },
                         output_dir / "best_model.pt",
@@ -606,6 +564,7 @@ def train_rl(
                 "epoch": config.training.num_epochs,
                 "model_state_dict": unwrapped_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": lr_scheduler.state_dict(),
             },
             output_dir / "final_model.pt",
         )

@@ -1,11 +1,10 @@
 # RL Training Configuration for Pix2Seq
-# Extends base training config with SCST/REINFORCE settings
+# REINFORCE fine-tuning on recall reward + IoU-supervised confidences
+# ("Tuning Computer Vision Models with Task Rewards", arXiv:2302.08242)
 
-# Inherit base data settings
 data:
   num_classes: 80
   max_instances: 100
-  class_label_corruption: "none"  # No corruption during RL fine-tuning
   image_size: 640
   jitter_scale: [0.3, 2.0]
   color_jitter_strength: 0.5
@@ -14,8 +13,6 @@ tokenization:
   quantization_bins: 1000
   noise_bbox_weight: 1.0
   eos_token_weight: 0.1
-  mix_rate: 0.5
-  random_ordering: true
 
 model:
   patch_size: 16
@@ -24,62 +21,67 @@ model:
   d_model: 256
   nhead: 8
   dim_feedforward: 1024
-  dropout: 0.0  # No dropout during RL fine-tuning
+  # Dropout must stay 0 for RL fine-tuning: rollouts sample in eval mode while
+  # re-scoring runs in train mode, and the two distributions must match
+  dropout: 0.0
   drop_path: 0.0
   shared_decoder_embedding: true
   decoder_output_bias: true
-  pad_token_id: 0
-  eos_token_id: 1
   llama_model: false
 
 training:
   output_dir: "./outputs_rl"
-  predictions_dir: "predictions"
-  num_epochs: 50  # Fewer epochs for fine-tuning
-  max_steps: null
-  batch_size: 16  # Smaller batch size (RL needs more memory for sampling)
+  num_epochs: 50
+  # Per-device batch size of images; the effective generation batch is
+  # batch_size * rl.num_samples_per_image sequences
+  batch_size: 8
   eval_batch_size: 50
-  gradient_accumulation_steps: 4  # Effective batch size = 64
-  gradient_clip_value: null
+  gradient_accumulation_steps: 4
   learning_rate: 0.000006  # Lower LR for fine-tuning
   weight_decay: 0.05
-  warmup_epochs: 2
   beta1: 0.9
   beta2: 0.95
   eps: 0.00000001
-  run_eval_freq: 5
-  overfit_eval_set: false
-  num_visualizations: 5
-  use_wsd_scheduler: true
+  # LR schedule: linear warmup (in optimizer updates) then "constant" or "cosine"
+  warmup_steps: 500
+  lr_schedule: "constant"
 
-generation:
-  top_p: 0.4
-  top_k: 0
-  temperature: 1.0
+evaluation:
+  eval_frequency: 5  # Evaluate mAP every N epochs
+  confidence_threshold: 0.05
 
 # RL-specific settings
 rl:
-  enabled: true
-  algorithm: "reinforce"  # "reinforce" or "ppo" (future)
+  algorithm: "reinforce"  # "ppo" reserved for future clipped-objective support
 
-  # Baseline type for variance reduction
-  baseline: "greedy"  # "greedy" (SCST) or "sample_mean"
+  # Advantage baseline: "loo" (leave-one-out mean of the other samples,
+  # paper-style), "mean", "grpo" ((r - mean)/std), or "greedy" (SCST)
+  advantage_type: "loo"
+
+  # Number of sequences sampled per image (K). Must be >= 2 for
+  # loo/mean/grpo; "greedy" also works with 1
+  num_samples_per_image: 4
+
+  # Sampling for rollouts: full temperature distribution. top_k/top_p must
+  # stay 0 - truncated sampling would bias the policy gradient
+  sampling:
+    temperature: 1.0
+    top_k: 0
+    top_p: 0.0
 
   # Reward settings
   reward:
-    type: "recall"
     iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
-    use_class_weights: false
-    confidence_threshold: 0.0
 
-  # IoU supervision loss
+  # IoU supervision loss (trains confidence scores to predict box IoU;
+  # needed for recall gains to translate into mAP gains)
   iou_supervision:
     enabled: true
     weight: 1.0
     min_iou_threshold: 0.0
 
-  # Advantage normalization
-  normalize_advantages: true
+  # Optional extra whitening of advantages across the batch
+  normalize_advantages: false
 
   # Gradient clipping
   max_grad_norm: 1.0
