@@ -4,6 +4,8 @@
 !/data/.gitkeep
 
 src/explore/videos/*
+/docs/2302.08242v1.pdf
+/model/final_model.pt
 
 # Nothing inside models should be tracked by git
 /models/*

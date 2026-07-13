@@ -144,7 +144,7 @@ FILE_PATH = Path(__file__).resolve().parent
 
 @script
 def train(
-    coco_dir: str = "/workspaces/object-detection-rl/data/coco",
+    coco_dir: str = "/workspaces/pix2seq/data/coco",
     config_file: str = "overfit_eval.yaml",
     copy_output_dir: bool = False,
     use_progress_bar: bool = True,

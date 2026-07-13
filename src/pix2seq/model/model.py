@@ -237,9 +237,26 @@ class Pix2SeqModel(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 0.4,
+        greedy: bool = False,
+        return_log_probs: bool = False,
+        training_mode: bool = False,
     ):
-        """Run inference using the improved sequence generator."""
+        """Run inference using the improved sequence generator.
 
+        Args:
+            images: Input images [B,C,H,W]
+            max_seq_len: Maximum sequence length to generate
+            temperature: Softmax temperature for sampling
+            top_k: Number of highest probability tokens to keep (0 = disabled)
+            top_p: Cumulative probability threshold for nucleus sampling
+            greedy: If True, use argmax instead of sampling (for SCST baseline)
+            return_log_probs: If True, return log probabilities for each token
+            training_mode: If True, disable inference_mode to allow gradient flow
+
+        Returns:
+            If return_log_probs=False: (sequences, class_logits, features)
+            If return_log_probs=True: (sequences, class_logits, features, log_probs)
+        """
         max_seq_len = min(max_seq_len, self.max_seq_len)
 
         # Create and reset caches before inference
@@ -254,7 +271,13 @@ class Pix2SeqModel(nn.Module):
             max_seq_len=max_seq_len,
         )
 
-        result = generator.generate(self, images)
+        result = generator.generate(
+            self,
+            images,
+            greedy=greedy,
+            return_log_probs=return_log_probs,
+            training_mode=training_mode,
+        )
 
         self.clear_decoder_caches()
 

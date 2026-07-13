@@ -6,7 +6,7 @@
     },
     "runArgs": [
         // ACTION NEEDED: uncomment the next line if your local machine has GPUs available
-        // "--gpus", "all",
+        "--gpus", "all",
         // Enable the docker container to access system resources
         "--ipc", "host",
         // mount cloudfiles to the container

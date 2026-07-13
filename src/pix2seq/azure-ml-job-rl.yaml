@@ -1,0 +1,46 @@
+# Azure ML Job Configuration for SCST/REINFORCE Training
+# Docs: https://docs.microsoft.com/en-us/azure/machine-learning/reference-yaml-job-command
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+# Name of the experiment
+experiment_name: pix2seq-rl-training
+
+# Display name for this specific run
+display_name: scst-finetune
+
+# What to run
+command: >-
+  python src/pix2seq/train_rl.py
+  --coco_dir ${{inputs.coco_data}}
+  --config_file train_rl.yaml
+  --pretrained_path ${{inputs.pretrained_model}}/checkpoint.pt
+  --eval_frequency 5
+
+inputs:
+  coco_data:
+    type: uri_folder
+    path: azureml:<coco-dataset-name>:<version>
+  pretrained_model:
+    type: uri_folder
+    path: azureml:<pretrained-model-name>:<version>
+
+# What code to make available
+code: .
+
+# Where to run it
+environment:
+  build:
+    path: ./environment
+
+# Compute target
+compute: azureml:<gpu-cluster-name>
+
+# Resources (optional, uncomment and adjust as needed)
+# resources:
+#   instance_count: 1
+#   shm_size: "16g"
+
+# Distribution (optional, for multi-GPU)
+# distribution:
+#   type: pytorch
+#   process_count_per_instance: 1
