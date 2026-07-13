@@ -13,4 +13,6 @@ exclude = '''
 profile = "black"
 
 [tool.pytest.ini_options]
-# None for the moment
+markers = [
+    "slow: longer-running tests (e.g. the RL overfit test)",
+]

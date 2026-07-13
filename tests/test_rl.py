@@ -1,15 +1,11 @@
 """Tests for the RL module."""
 
-import torch
 import pytest
+import torch
 
-# Add src to path for imports
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "pix2seq"))
-
-from rl.rewards import compute_iou, compute_recall_at_iou, RecallReward
+# conftest.py adds src/pix2seq to sys.path
 from rl.iou_loss import IoUSupervisionLoss
+from rl.rewards import RecallReward, compute_iou, compute_recall_at_iou
 
 
 class TestComputeIoU:
@@ -109,6 +105,63 @@ class TestRecallAtIoU:
         gt_boxes = torch.tensor([]).reshape(0, 4)
         recall = compute_recall_at_iou(pred_boxes, gt_boxes, iou_threshold=0.5)
         assert recall == 1.0
+
+
+class TestRecallReward:
+    """Tests for the batch reward computation."""
+
+    def test_call_decodes_sequences(self, token_processor):
+        from conftest import make_sequence
+
+        box = [0.2, 0.2, 0.6, 0.6]
+        sequences = torch.cat(
+            [
+                make_sequence(token_processor, boxes=[box], labels=[1]),
+                make_sequence(token_processor, boxes=[], labels=[]),  # empty
+            ]
+        )
+        reward_fn = RecallReward(token_processor)
+        rewards = reward_fn(
+            sequences=sequences,
+            gt_boxes_list=[torch.tensor([box]), torch.tensor([box])],
+            gt_labels_list=[torch.tensor([1]), torch.tensor([1])],
+        )
+        assert rewards.shape == (2,)
+        assert rewards.dtype == torch.float32
+        assert rewards[0].item() == 1.0  # perfect prediction
+        assert rewards[1].item() == 0.0  # no predictions
+
+    def test_class_mismatch_gives_zero_recall(self, token_processor):
+        from conftest import make_sequence
+
+        box = [0.2, 0.2, 0.6, 0.6]
+        sequences = make_sequence(token_processor, boxes=[box], labels=[2])
+        reward_fn = RecallReward(token_processor)
+        rewards = reward_fn(
+            sequences=sequences,
+            gt_boxes_list=[torch.tensor([box])],
+            gt_labels_list=[torch.tensor([1])],  # different class
+        )
+        assert rewards[0].item() == 0.0
+
+    def test_class_weights_applied_once(self, token_processor):
+        """Weighted recall is a weighted average of per-class recalls."""
+        weights = torch.tensor([1.0, 3.0, 1.0, 1.0, 1.0])
+        reward_fn = RecallReward(token_processor, class_weights=weights)
+
+        pred_boxes = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+        pred_labels = torch.tensor([0])
+        gt_boxes = torch.tensor([[0.0, 0.0, 1.0, 1.0], [2.0, 2.0, 3.0, 3.0]])
+        gt_labels = torch.tensor([0, 1])
+
+        reward = reward_fn._compute_class_aware_reward(
+            pred_boxes, gt_boxes, pred_labels, gt_labels
+        )
+        # class 0: recall 1 (weight 1, count 1); class 1: recall 0 (weight 3,
+        # count 1) -> (1*1 + 0*3) / (1 + 3) = 0.25. Double-applied weights
+        # would give (1*1 + 0*9) / (1 + 3) instead for other weightings;
+        # the key check is the weighted average stays in [0, 1]
+        assert abs(reward - 0.25) < 1e-6
 
 
 class TestIoUSupervisionLoss:
