@@ -1,117 +1,102 @@
-# SCST/REINFORCE Training Implementation for Pix2Seq
+# REINFORCE Training for Pix2Seq
 
 ## Overview
 
-This document describes the implementation of Self-Critical Sequence Training (SCST) for fine-tuning Pix2Seq models directly on task rewards, based on the paper ["Tuning Computer Vision Models with Task Rewards"](https://arxiv.org/abs/2302.08242).
+This document describes the RL fine-tuning implementation for Pix2Seq, based on
+["Tuning Computer Vision Models with Task Rewards"](https://arxiv.org/abs/2302.08242)
+(Pinto et al., ICML 2023).
 
 ## Background
 
 ### The Problem
 
-Standard Pix2Seq training uses cross-entropy loss (MLE) to predict the next token. However, the model is evaluated using mAP. This creates a mismatch between training objective and evaluation metric.
+Standard Pix2Seq training uses cross-entropy loss (MLE) to predict the next
+token, but the model is evaluated with mAP. This creates a mismatch between the
+training objective and the evaluation metric.
 
-### The Solution
+### The Solution (two-part, from the paper)
 
-SCST uses REINFORCE (policy gradient) to fine-tune the model directly on recall-based rewards:
+1. **REINFORCE on a recall reward**: fine-tune the sequence policy directly on
+   per-image recall (averaged over the COCO IoU thresholds).
+2. **IoU-supervised confidences**: train the class-token confidence to predict
+   the IoU of its box with ground truth, so box ranking (and therefore mAP)
+   improves alongside recall.
 
 ```
-Loss = -(reward(sample) - reward(greedy)) × log_prob(sample)
+L = -(advantage) * sum log p(sampled tokens)  +  lambda * MSE(confidence, IoU)
 ```
 
-Key insight from the paper: **mAP correlates with recall** when the model ranks boxes well, so we use recall as the reward signal.
+The paper reports mAP improving from 39.2 to 54.3 with this recipe.
 
-## Implementation Summary
+## Architecture: rollout + teacher-forced re-scoring
 
-### Files Modified
+Backpropagating through autoregressive generation is not possible here (the KV
+cache writes its buffers in place, which breaks autograd) and would be
+memory-prohibitive. Instead, each training step does:
 
-| File | Changes |
-|------|---------|
-| `model/inference.py` | Added `greedy`, `return_log_probs`, `training_mode` parameters |
-| `model/model.py` | Updated `infer()` to pass through new parameters |
-| `model/modelv2.py` | Same updates as model.py |
+1. **Rollout (no gradients)**: the unwrapped model samples K sequences per
+   image under `torch.inference_mode()` with the KV cache. Images are encoded
+   once; encoded features are repeated K times (`num_samples` in
+   `generate()`/`infer()`). Sampling uses the **full temperature distribution**
+   (top-k/top-p disabled — truncated sampling would bias the policy gradient).
+2. **Rewards + advantages**: sequences decode to boxes; per-image recall is
+   averaged over IoU thresholds; advantages come from a group baseline (below).
+3. **Re-scoring (gradients)**: one teacher-forced forward pass — the same code
+   path as MLE training — through the *accelerator-wrapped* model recomputes
+   log-probs of the sampled tokens. The generation-time constraint masks are
+   rebuilt vectorized (`rl/rescoring.py:build_constraint_masks`) and the same
+   temperature applied, so the re-scored distribution equals the sampling
+   distribution exactly (tested to 1e-4 in `tests/test_rescoring.py`).
+4. **Losses**: REINFORCE loss over tokens up to the first EOS, plus the
+   IoU-supervision MSE on differentiable class-token confidences from the same
+   forward pass.
 
-### Files Added
+Because the gradient-carrying forward pass goes through the wrapped model's
+`__call__`, DDP gradient synchronisation works under `accelerate launch`.
+
+## Advantage baselines (`rl.advantage_type`)
+
+| Type | Baseline | Notes |
+|------|----------|-------|
+| `loo` (default) | mean reward of the *other* K-1 samples | Paper-style multi-sample baseline; requires K >= 2 |
+| `mean` | group mean | requires K >= 2 |
+| `grpo` | (r - group mean) / (group std + eps) | GRPO advantages; requires K >= 2 |
+| `greedy` | reward of a greedy decode (SCST) | works with K = 1, costs an extra greedy pass |
+
+### GRPO status
+
+`advantage_type: grpo` already gives GRPO's advantage structure. The remaining
+GRPO/PPO ingredients (per-token ratio clipping against the rollout's
+generation-time log-probs, optional KL to a reference model) slot into
+`compute_policy_gradient_loss` via its `old_per_token_log_probs`/`clip_range`
+parameters — the rollout already returns generation-time log-probs for this.
+Setting `clip_range` currently raises `NotImplementedError`.
+
+## Files
 
 | File | Purpose |
 |------|---------|
-| `rl/__init__.py` | Module exports |
-| `rl/rewards.py` | Per-image recall reward computation |
-| `rl/iou_loss.py` | Supervised IoU loss for confidence prediction |
-| `rl/reinforce.py` | REINFORCE trainer with self-critical baseline |
-| `train_rl.py` | RL training script with multi-GPU support |
+| `rl/rescoring.py` | Teacher-forced re-scoring: constraint-mask rebuild, valid-token mask, differentiable log-probs and class confidences |
+| `rl/rewards.py` | Per-image recall reward (class-aware, IoU-threshold averaged) |
+| `rl/iou_loss.py` | MSE between class-token confidence and best-matching-GT IoU |
+| `rl/reinforce.py` | Config, advantages, policy-gradient loss, `REINFORCETrainer` |
+| `rl/evaluation.py` | Greedy-decoding mAP evaluation reusing the base trainer's box scaling |
+| `train_rl.py` | Training loop: gradient accumulation, LR warmup, checkpointing, MLflow logging |
 | `config/train_rl.yaml` | RL training configuration |
-| `tests/test_rl.py` | Unit tests |
+| `tests/` | Synthetic test suite (see `test_rescoring.py` for the core invariant) |
 
-## Architecture
+`model/inference.py` gained `greedy`, `return_log_probs` and `num_samples`
+parameters on `generate()` (all defaults preserve existing behaviour), and
+`model.forward()` gained `num_tgt_per_image` for scoring K sequences per image
+with one encoder pass.
 
-### SequenceGenerator Extensions
-
-```python
-def generate(
-    self,
-    model,
-    images,
-    greedy=False,           # NEW: Use argmax instead of sampling
-    return_log_probs=False, # NEW: Return token log probabilities
-    training_mode=False,    # NEW: Allow gradient flow
-):
-    ...
-```
-
-All parameters have defaults that preserve existing behavior.
-
-### Reward Computation
-
-```python
-class RecallReward:
-    """Computes per-image recall averaged across IoU thresholds."""
-
-    def __call__(self, sequences, class_logits, gt_boxes, gt_labels):
-        # 1. Decode sequences to boxes
-        # 2. Match predictions to GT using IoU
-        # 3. Compute recall = matched_gt / total_gt
-        # 4. Average across thresholds [0.5, 0.55, ..., 0.95]
-        return rewards  # [B] tensor
-```
-
-### REINFORCE Trainer
-
-```python
-class REINFORCETrainer:
-    """SCST training loop following simple-ppo structure."""
-
-    def train_step(self, batch):
-        # 1. Sample sequences with log probs
-        # 2. Generate greedy baseline
-        # 3. Compute rewards for both
-        # 4. Advantage = sample_reward - greedy_reward
-        # 5. Loss = -advantage × log_prob
-        # 6. Optional: IoU supervision loss
-        return stats
-```
-
-### Two-Part Loss (from paper)
-
-1. **REINFORCE Loss**: Optimizes recall
-   ```
-   L_RL = -(advantage) × Σ log_prob(tokens)
-   ```
-
-2. **IoU Supervision Loss**: Trains confidence scores
-   ```
-   L_IoU = MSE(predicted_confidence, actual_IoU)
-   ```
-
-3. **Total Loss**:
-   ```
-   L = L_RL + λ × L_IoU
-   ```
+Note: fixing the RL sampling also fixed a pre-existing generation bug — the
+dynamic ymax/xmax constraint masks were previously unioned across the batch, so
+per-sample `ymax > ymin`/`xmax > xmin` was not enforced for batch sizes > 1.
+Constraints are now correctly per-sample, which can slightly change eval
+generation for existing checkpoints.
 
 ## Usage
-
-### Training Script
-
-The recommended way to run RL training is via the `train_rl.py` script:
 
 ```bash
 # Single GPU
@@ -119,111 +104,69 @@ python train_rl.py --pretrained_path /path/to/mle_checkpoint.pt
 
 # Multi-GPU with Accelerate
 accelerate launch train_rl.py --pretrained_path /path/to/mle_checkpoint.pt
-
-# With custom config
-python train_rl.py \
-    --pretrained_path /path/to/checkpoint.pt \
-    --config_file train_rl.yaml \
-    --coco_dir /path/to/coco \
-    --eval_frequency 5
 ```
 
-The script supports:
-- **Multi-GPU training** via Hugging Face Accelerate
-- **MLflow/AzureML logging** (automatically enabled when `MLFLOW_TRACKING_URI` is set)
-- **Periodic mAP evaluation** during training
-- **Checkpointing** of best and final models
+Batch format expected by `REINFORCETrainer.compute_losses` (produced by
+`RLCollator`):
 
-### Programmatic Usage
-
-```python
-from rl import REINFORCETrainer, RecallReward, IoUSupervisionLoss, RLTrainingConfig
-
-# Load pretrained MLE model
-model = load_checkpoint("path/to/mle_model.pt")
-
-# Create RL components
-reward_fn = RecallReward(token_processor)
-iou_loss_fn = IoUSupervisionLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
-
-# Create trainer
-trainer = REINFORCETrainer(
-    model=model,
-    token_processor=token_processor,
-    optimizer=optimizer,
-    reward_fn=reward_fn,
-    iou_loss_fn=iou_loss_fn,
-    config=RLTrainingConfig(
-        baseline="greedy",
-        normalize_advantages=True,
-        iou_loss_weight=1.0,
-    ),
-)
-
-# Training loop
-for epoch in range(num_epochs):
-    for batch in dataloader:
-        stats = trainer.train_step(batch)
-        print(f"Loss: {stats['loss/total']:.4f}")
-```
-
-### Batch Format
-
-The trainer expects batches with:
 ```python
 batch = {
     "image": torch.Tensor,           # [B, C, H, W]
-    "gt_boxes": List[torch.Tensor],  # List of [M_i, 4] in XYXY format
+    "gt_boxes": List[torch.Tensor],  # List of [M_i, 4], normalized XYXY
     "gt_labels": List[torch.Tensor], # List of [M_i] class indices
 }
 ```
 
 ## Configuration
 
-See `config/train_rl.yaml` for all options:
+See `config/train_rl.yaml`. Key settings:
 
 ```yaml
+training:
+  batch_size: 8                    # images per device; K sequences each
+  gradient_accumulation_steps: 4
+  warmup_steps: 500
+  lr_schedule: "constant"          # or "cosine"
+
 rl:
-  enabled: true
-  algorithm: "reinforce"
-  baseline: "greedy"
-
-  reward:
-    type: "recall"
-    iou_thresholds: [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
-
+  advantage_type: "loo"            # loo | mean | grpo | greedy
+  num_samples_per_image: 4         # K
+  sampling:
+    temperature: 1.0
+    top_k: 0                       # must stay 0
+    top_p: 0.0                     # must stay 0
   iou_supervision:
     enabled: true
     weight: 1.0
-
-  normalize_advantages: true
-  max_grad_norm: 1.0
 ```
 
-## Training Tips
+## Training tips
 
-1. **Start from MLE-pretrained model**: SCST is a fine-tuning technique
-2. **Use lower learning rate**: 3e-5 vs 3e-4 for MLE
-3. **Smaller batch size**: RL needs memory for sampling twice (sample + greedy)
-4. **Monitor advantage**: Should be ~0 mean after normalization
-5. **Watch for reward improvement**: sample_reward should increase
+1. **Start from an MLE-pretrained model** — RL is a fine-tuning step.
+2. **Keep dropout at 0** — rollouts sample in eval mode while re-scoring runs
+   in train mode; with dropout the two distributions diverge (the trainer
+   warns about this).
+3. **Watch `reward/sample_mean`** — it should climb; `policy/tokens_per_seq_mean`
+   shows whether the policy is collapsing to early EOS.
+4. **Memory**: the re-scoring pass materialises `[B*K, S-1, V]` logits; lower
+   `batch_size` or K if needed.
 
-## Backwards Compatibility
+## Testing
 
-All changes are backwards compatible:
-- New parameters have defaults matching original behavior
-- Existing training code works unchanged
-- Existing checkpoints load without issues
+```bash
+python -m pytest tests/ -q
+```
 
-## Future Extensions
+The suite runs on CPU with a tiny randomly initialised model. The core tests:
 
-1. **PPO**: Add clipped objective, value function, GAE
-2. **Different rewards**: AP@50, F1 score, weighted recall
-3. **Curriculum**: Start with high temperature, anneal down
+- `test_rescoring.py`: re-scored log-probs equal generation log-probs.
+- `test_constraint_masks.py`: mask rebuild matches generation per step.
+- `test_rl_integration.py::TestOverfitToyBatch`: reward increases when
+  overfitting a toy batch end-to-end.
 
 ## References
 
 - [Tuning Computer Vision Models with Task Rewards](https://arxiv.org/abs/2302.08242)
 - [Self-critical Sequence Training for Image Captioning](https://arxiv.org/abs/1612.00563)
 - [Pix2seq: A Language Modeling Framework for Object Detection](https://arxiv.org/abs/2109.10852)
+- [DeepSeekMath (GRPO)](https://arxiv.org/abs/2402.03300)
