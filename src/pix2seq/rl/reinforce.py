@@ -1,23 +1,33 @@
-"""REINFORCE trainer with self-critical baseline (SCST) for Pix2Seq.
+"""REINFORCE trainer for Pix2Seq with multi-sample (GRPO-style) baselines.
 
-Implements Self-Critical Sequence Training as described in:
-- "Self-critical Sequence Training for Image Captioning" (Rennie et al., 2017)
+Implements policy-gradient fine-tuning as described in:
 - "Tuning Computer Vision Models with Task Rewards" (Pinto et al., 2023)
+- "Self-critical Sequence Training for Image Captioning" (Rennie et al., 2017)
 
-The training loop structure follows the pattern from simple-ppo.
-Supports multi-GPU training via Hugging Face Accelerate.
+Per training step:
+1. Sample K sequences per image without gradients (rollout).
+2. Compute per-sequence rewards and group-based advantages.
+3. Re-score the sampled sequences with a single teacher-forced forward pass
+   through the (possibly DDP-wrapped) model to obtain differentiable log-probs
+   (see ``rl.rescoring``).
+4. Loss = -(advantage * sum log-prob) + optional IoU-supervision loss.
+
+The trainer owns loss computation only; the training loop owns the optimizer,
+backward pass and gradient accumulation (so ``accelerator.accumulate`` works).
 """
 
+import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from data.tokenizer import TokenProcessor
 
-from .rewards import RecallReward
 from .iou_loss import IoUSupervisionLoss
+from .rescoring import extract_object_confidences, rescore_sequences
+from .rewards import RecallReward
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
@@ -27,389 +37,391 @@ if TYPE_CHECKING:
 class RLTrainingConfig:
     """Configuration for RL training."""
 
-    # Baseline type
-    baseline: str = "greedy"  # "greedy" or "sample_mean"
+    # "reinforce" is implemented; "ppo" (ratio clipping + KL to reference) is
+    # reserved for a future extension - see compute_policy_gradient_loss
+    algorithm: str = "reinforce"
+
+    # Advantage baseline:
+    #   "greedy": r - r(greedy decode)          (SCST; works with K = 1)
+    #   "loo":    r_i - mean(r_others in group) (leave-one-out; requires K >= 2)
+    #   "mean":   r_i - mean(group)             (requires K >= 2)
+    #   "grpo":   (r_i - mean(group)) / (std(group) + eps)  (requires K >= 2)
+    advantage_type: str = "loo"
+
+    # Number of sequences sampled per image (K)
+    num_samples_per_image: int = 4
+
+    # Sampling parameters. top_k/top_p must stay disabled: REINFORCE requires
+    # the log-probs used in the loss to describe the distribution that was
+    # actually sampled from, and re-scoring reproduces the full temperature
+    # distribution only
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 0.0
 
     # Loss weights
     iou_loss_weight: float = 1.0
 
-    # Advantage normalization
-    normalize_advantages: bool = True
+    # Optional extra whitening of advantages across the whole batch
+    normalize_advantages: bool = False
 
-    # Gradient clipping
+    # Gradient clipping (applied by the training loop)
     max_grad_norm: float = 1.0
 
-    # Generation parameters for sampling
-    temperature: float = 1.0
-    top_k: int = 0
-    top_p: float = 0.4
+    # Optional cap on generation length during rollouts (defaults to the token
+    # processor's max_seq_len)
+    max_gen_len: Optional[int] = None
 
-    # Logging
-    log_interval: int = 10
+    def __post_init__(self):
+        if self.algorithm != "reinforce":
+            raise NotImplementedError(
+                f"algorithm='{self.algorithm}' is not implemented (only 'reinforce')"
+            )
+        if self.advantage_type not in ("greedy", "loo", "mean", "grpo"):
+            raise ValueError(f"Unknown advantage_type: {self.advantage_type}")
+        if self.top_k != 0 or self.top_p != 0.0:
+            raise ValueError(
+                "top_k/top_p filtering must be disabled for RL sampling: the "
+                "teacher-forced re-scoring computes log-probs of the full "
+                "temperature distribution, so sampling from a truncated one "
+                "would bias the policy gradient"
+            )
+        if self.advantage_type != "greedy" and self.num_samples_per_image < 2:
+            raise ValueError(
+                f"advantage_type='{self.advantage_type}' requires "
+                f"num_samples_per_image >= 2, got {self.num_samples_per_image}"
+            )
+
+
+@dataclass
+class Rollout:
+    """Sequences sampled for one batch of images.
+
+    All tensors are ordinary (non-inference-mode) tensors without gradients.
+
+    Attributes:
+        sequences: [B*K, S] sampled sequences (incl. BOS), grouped per image in
+            repeat_interleave order
+        gen_log_probs: [B*K, S-1] generation-time log-probs of the sampled
+            tokens (useful for tests and as "old" log-probs for a future
+            PPO-style clipped objective)
+        greedy_sequences: [B, S'] greedy-decoded sequences, only present when
+            the greedy (SCST) baseline is used
+    """
+
+    sequences: torch.Tensor
+    gen_log_probs: torch.Tensor
+    greedy_sequences: Optional[torch.Tensor] = None
+
+
+def compute_advantages(
+    sample_rewards: torch.Tensor,
+    num_samples: int,
+    advantage_type: str,
+    greedy_rewards: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute per-sequence advantages from grouped rewards.
+
+    Args:
+        sample_rewards: [B*K] rewards, grouped per image in repeat_interleave
+            order (all K samples of image 0 first, then image 1, ...)
+        num_samples: K, number of samples per image
+        advantage_type: "greedy" | "loo" | "mean" | "grpo"
+        greedy_rewards: [B] rewards of the greedy baseline (required for
+            advantage_type="greedy")
+        eps: Numerical stabiliser for the grpo std division
+
+    Returns:
+        advantages: [B*K]
+    """
+    if advantage_type == "greedy":
+        if greedy_rewards is None:
+            raise ValueError("greedy_rewards required for advantage_type='greedy'")
+        return sample_rewards - greedy_rewards.repeat_interleave(num_samples)
+
+    if num_samples < 2:
+        raise ValueError(
+            f"advantage_type='{advantage_type}' requires num_samples >= 2"
+        )
+
+    grouped = sample_rewards.reshape(-1, num_samples)  # [B, K]
+    group_mean = grouped.mean(dim=1, keepdim=True)
+
+    if advantage_type == "loo":
+        # Leave-one-out baseline: mean of the *other* samples in the group,
+        # equivalent to (r - mean) * K / (K - 1)
+        advantages = (grouped - group_mean) * (num_samples / (num_samples - 1))
+    elif advantage_type == "mean":
+        advantages = grouped - group_mean
+    elif advantage_type == "grpo":
+        group_std = grouped.std(dim=1, keepdim=True)
+        advantages = (grouped - group_mean) / (group_std + eps)
+    else:
+        raise ValueError(f"Unknown advantage_type: {advantage_type}")
+
+    return advantages.reshape(-1)
+
+
+def compute_policy_gradient_loss(
+    per_token_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    mask: torch.Tensor,
+    old_per_token_log_probs: Optional[torch.Tensor] = None,
+    clip_range: Optional[float] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """REINFORCE policy-gradient loss.
+
+    Args:
+        per_token_log_probs: [N, S-1] differentiable log-probs from re-scoring
+            (zero at masked positions)
+        advantages: [N] per-sequence advantages (detached inside)
+        mask: [N, S-1] valid-token mask (up to and including first EOS)
+        old_per_token_log_probs: Generation-time log-probs; only used by the
+            future PPO-style clipped objective
+        clip_range: PPO clip epsilon. Setting this (together with
+            old_per_token_log_probs) is the extension point for a clipped
+            surrogate objective (GRPO/PPO); not implemented yet.
+
+    Returns:
+        (loss, stats) where stats contains sequence-level log-prob diagnostics
+    """
+    if clip_range is not None:
+        raise NotImplementedError(
+            "Clipped surrogate objective (PPO/GRPO) is not implemented yet; "
+            "old_per_token_log_probs/clip_range are the extension hook"
+        )
+
+    log_probs = torch.where(
+        mask, per_token_log_probs, torch.zeros_like(per_token_log_probs)
+    )
+    sequence_log_probs = log_probs.sum(dim=1)  # [N]
+
+    loss = -(advantages.detach() * sequence_log_probs).mean()
+
+    stats = {
+        "policy/seq_log_prob_mean": sequence_log_probs.mean().item(),
+        "policy/tokens_per_seq_mean": mask.float().sum(dim=1).mean().item(),
+    }
+    return loss, stats
 
 
 class REINFORCETrainer:
-    """REINFORCE trainer with self-critical baseline for Pix2Seq.
+    """Computes REINFORCE losses for Pix2Seq RL fine-tuning.
 
-    This trainer implements the SCST algorithm:
-    1. Sample sequences from the model
-    2. Compute greedy baseline sequences
-    3. Compute rewards for both
-    4. Update policy using REINFORCE gradient with advantage = sample_reward - baseline_reward
+    The trainer does not own the optimizer: call ``compute_losses`` inside the
+    training loop, then run backward/clip/step there (e.g. within
+    ``accelerator.accumulate(model)``).
     """
 
     def __init__(
         self,
         model: nn.Module,
         token_processor: TokenProcessor,
-        optimizer: torch.optim.Optimizer,
         reward_fn: RecallReward,
         iou_loss_fn: Optional[IoUSupervisionLoss] = None,
         config: Optional[RLTrainingConfig] = None,
-        device: Optional[torch.device] = None,
         accelerator: Optional["Accelerator"] = None,
     ):
         """Initialize REINFORCE trainer.
 
         Args:
-            model: Pix2Seq model (must have infer method with new RL parameters)
+            model: Pix2Seq model. Pass the accelerator-prepared (wrapped) model
+                so the re-scoring forward pass synchronises gradients under DDP.
             token_processor: TokenProcessor for decoding sequences
-            optimizer: Optimizer for policy updates
             reward_fn: Reward function (RecallReward)
-            iou_loss_fn: Optional IoU supervision loss
+            iou_loss_fn: Optional IoU supervision loss for confidence training
             config: Training configuration
-            device: Device to run training on (ignored if accelerator provided)
             accelerator: Optional Accelerator for multi-GPU training
         """
         self.model = model
         self.token_processor = token_processor
-        self.optimizer = optimizer
         self.reward_fn = reward_fn
         self.iou_loss_fn = iou_loss_fn
         self.config = config or RLTrainingConfig()
         self.accelerator = accelerator
 
-        # Device handling: prefer accelerator if available
-        if accelerator is not None:
-            self.device = accelerator.device
-        elif device is not None:
-            self.device = device
-        else:
-            self.device = next(model.parameters()).device
+        self.max_gen_len = self.config.max_gen_len or token_processor.max_seq_len
 
-        # Training stats
-        self.global_step = 0
-        self.stats_history: List[Dict[str, float]] = []
+        unwrapped = self._get_unwrapped_model()
+        has_active_dropout = any(
+            isinstance(m, nn.Dropout) and m.p > 0 for m in unwrapped.modules()
+        )
+        if has_active_dropout:
+            warnings.warn(
+                "Model has active dropout. Rollouts run in eval mode while "
+                "re-scoring runs in train mode, so with dropout enabled the "
+                "re-scored distribution will not match the sampling "
+                "distribution. Set dropout/drop_path to 0.0 for RL fine-tuning."
+            )
 
     def _get_unwrapped_model(self):
-        """Get the unwrapped model for inference (handles DDP wrapping)."""
+        """Get the unwrapped model (handles DDP wrapping)."""
         if self.accelerator is not None:
             return self.accelerator.unwrap_model(self.model)
         return self.model
 
-    def collect_samples(
-        self,
-        images: torch.Tensor,
-        gt_boxes_list: List[torch.Tensor],
-        gt_labels_list: List[torch.Tensor],
-    ) -> Dict[str, Any]:
-        """Collect sampled and baseline sequences with rewards.
+    @torch.no_grad()
+    def sample_rollouts(self, images: torch.Tensor) -> Rollout:
+        """Sample K sequences per image (plus greedy baseline if configured).
+
+        Generation runs on the unwrapped model in eval mode (the KV cache
+        requires eval mode, and generation carries no gradients).
 
         Args:
             images: [B, C, H, W] input images
-            gt_boxes_list: List of [M_i, 4] ground truth boxes per image
-            gt_labels_list: List of [M_i] ground truth labels per image
 
         Returns:
-            Dictionary containing:
-                - sampled_seqs: [B, S] sampled sequences
-                - sampled_log_probs: [B, S] log probs of sampled tokens
-                - sampled_logits: [B, N, V] class logits for sampled sequences
-                - sample_rewards: [B] rewards for sampled sequences
-                - baseline_rewards: [B] rewards for baseline sequences
+            Rollout with sequences grouped per image in repeat_interleave order
         """
-        # Ensure model is in eval mode for generation but track gradients
-        was_training = self.model.training
-        self.model.eval()
+        unwrapped = self._get_unwrapped_model()
+        was_training = unwrapped.training
+        unwrapped.eval()
 
-        # Get unwrapped model for inference (handles DDP wrapping)
-        unwrapped_model = self._get_unwrapped_model()
-
-        # Sample sequences with log probabilities
-        sampled_seqs, sampled_logits, _, sampled_log_probs = unwrapped_model.infer(
-            images=images,
-            temperature=self.config.temperature,
-            top_k=self.config.top_k,
-            top_p=self.config.top_p,
-            greedy=False,
-            return_log_probs=True,
-            training_mode=True,  # Allow gradient flow through log probs
-        )
-
-        # Compute baseline sequences (greedy, no gradients needed)
-        with torch.no_grad():
-            baseline_seqs, baseline_logits, _ = unwrapped_model.infer(
+        try:
+            sequences, _, _, gen_log_probs = unwrapped.infer(
                 images=images,
-                greedy=True,
-                return_log_probs=False,
-                training_mode=False,
+                max_seq_len=self.max_gen_len,
+                temperature=self.config.temperature,
+                top_k=self.config.top_k,
+                top_p=self.config.top_p,
+                greedy=False,
+                return_log_probs=True,
+                num_samples=self.config.num_samples_per_image,
             )
 
-        # Restore training mode if needed
-        if was_training:
-            self.model.train()
+            greedy_sequences = None
+            if self.config.advantage_type == "greedy":
+                greedy_sequences, _, _ = unwrapped.infer(
+                    images=images,
+                    max_seq_len=self.max_gen_len,
+                    temperature=self.config.temperature,
+                    greedy=True,
+                )
+                greedy_sequences = greedy_sequences.clone()
+        finally:
+            if was_training:
+                unwrapped.train()
 
-        # Compute rewards
-        sample_rewards = self.reward_fn(
-            sequences=sampled_seqs,
-            class_logits=sampled_logits,
-            gt_boxes_list=gt_boxes_list,
-            gt_labels_list=gt_labels_list,
+        # Clone to escape inference-mode tensor status (autograd needs to save
+        # the sequences during re-scoring)
+        return Rollout(
+            sequences=sequences.clone(),
+            gen_log_probs=gen_log_probs.clone(),
+            greedy_sequences=greedy_sequences,
         )
 
-        baseline_rewards = self.reward_fn(
-            sequences=baseline_seqs,
-            class_logits=baseline_logits,
-            gt_boxes_list=gt_boxes_list,
-            gt_labels_list=gt_labels_list,
-        )
-
-        return {
-            "sampled_seqs": sampled_seqs,
-            "sampled_log_probs": sampled_log_probs,
-            "sampled_logits": sampled_logits,
-            "sample_rewards": sample_rewards,
-            "baseline_rewards": baseline_rewards,
-        }
-
-    def compute_advantages(
-        self,
-        sample_rewards: torch.Tensor,
-        baseline_rewards: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute advantages using self-critical baseline.
-
-        Args:
-            sample_rewards: [B] rewards for sampled sequences
-            baseline_rewards: [B] rewards for baseline (greedy) sequences
-
-        Returns:
-            advantages: [B] advantage values
-        """
-        advantages = sample_rewards - baseline_rewards
-
-        if self.config.normalize_advantages and len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        return advantages
-
-    def get_valid_token_mask(self, sequences: torch.Tensor) -> torch.Tensor:
-        """Get mask for valid (non-padding) tokens.
-
-        Args:
-            sequences: [B, S] token sequences
-
-        Returns:
-            mask: [B, S] boolean mask (True for valid tokens)
-        """
-        # Valid tokens are everything except padding (after EOS)
-        padding_token = self.token_processor.PADDING_TOKEN
-        eos_token = self.token_processor.EOS_TOKEN
-
-        # Create mask: True for non-padding tokens
-        mask = sequences != padding_token
-
-        # Also mask out tokens after EOS
-        batch_size, seq_len = sequences.shape
-        for b in range(batch_size):
-            eos_positions = (sequences[b] == eos_token).nonzero(as_tuple=True)[0]
-            if len(eos_positions) > 0:
-                first_eos = eos_positions[0].item()
-                # Keep tokens up to and including first EOS
-                mask[b, first_eos + 1:] = False
-
-        return mask
-
-    def compute_reinforce_loss(
-        self,
-        log_probs: torch.Tensor,
-        advantages: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute REINFORCE policy gradient loss.
-
-        Args:
-            log_probs: [B, S] log probabilities of each token
-            advantages: [B] advantage values (sample_reward - baseline_reward)
-            mask: [B, S] valid token mask
-
-        Returns:
-            loss: Scalar REINFORCE loss
-        """
-        # Sum log probs over valid tokens in sequence
-        # log_probs is [B, S], we need to account for the fact that
-        # log_probs may be shorter than mask if early EOS
-        min_len = min(log_probs.size(1), mask.size(1))
-        log_probs = log_probs[:, :min_len]
-        mask = mask[:, :min_len]
-
-        masked_log_probs = log_probs * mask.float()
-        sequence_log_probs = masked_log_probs.sum(dim=1)  # [B]
-
-        # REINFORCE: maximize expected reward = minimize -advantage * log_prob
-        # Detach advantages to prevent gradient flow through reward computation
-        loss = -(advantages.detach() * sequence_log_probs).mean()
-
-        return loss
-
-    def compute_iou_supervision_loss(
-        self,
-        sampled_seqs: torch.Tensor,
-        sampled_logits: torch.Tensor,
-        gt_boxes_list: List[torch.Tensor],
-    ) -> torch.Tensor:
-        """Compute IoU supervision loss for confidence prediction.
-
-        Args:
-            sampled_seqs: [B, S] sampled token sequences
-            sampled_logits: [B, N, V] class logits
-            gt_boxes_list: List of [M_i, 4] ground truth boxes per image
-
-        Returns:
-            loss: Scalar IoU supervision loss
-        """
-        if self.iou_loss_fn is None:
-            return torch.tensor(0.0, device=self.device)
-
-        # Decode sequences to get boxes and confidences
-        pred_boxes_list, _, pred_scores_list = (
-            self.token_processor.post_process_sequences(
-                sequences=sampled_seqs,
-                class_logits=sampled_logits,
-                confidence_threshold=0.0,  # Include all predictions
-            )
-        )
-
-        # Filter out None scores and convert to proper format
-        valid_boxes = []
-        valid_scores = []
-        valid_gt = []
-
-        for pred_boxes, pred_scores, gt_boxes in zip(
-            pred_boxes_list, pred_scores_list, gt_boxes_list
-        ):
-            if pred_scores is not None and len(pred_boxes) > 0:
-                valid_boxes.append(pred_boxes)
-                valid_scores.append(pred_scores)
-                valid_gt.append(gt_boxes)
-
-        if len(valid_boxes) == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-
-        return self.iou_loss_fn(valid_boxes, valid_scores, valid_gt)
-
-    def train_step(
-        self,
-        batch: Dict[str, Any],
-    ) -> Dict[str, float]:
-        """Perform a single training step.
+    def compute_losses(
+        self, batch: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute the total RL loss for one batch.
 
         Args:
             batch: Dictionary containing:
                 - image: [B, C, H, W] input images
-                - gt_boxes: List of [M_i, 4] ground truth boxes
+                - gt_boxes: List of [M_i, 4] ground truth boxes (normalized XYXY)
                 - gt_labels: List of [M_i] ground truth labels
 
         Returns:
-            Dictionary of training statistics
+            (total_loss, stats). The caller runs backward/step.
         """
-        images = batch["image"].to(self.device)
+        images = batch["image"]
         gt_boxes_list = batch["gt_boxes"]
         gt_labels_list = batch["gt_labels"]
+        num_samples = self.config.num_samples_per_image
 
-        # Collect samples and compute rewards
-        samples = self.collect_samples(images, gt_boxes_list, gt_labels_list)
+        # 1. Rollout (no gradients)
+        rollout = self.sample_rollouts(images)
 
-        # Compute advantages
-        advantages = self.compute_advantages(
-            samples["sample_rewards"],
-            samples["baseline_rewards"],
+        # 2. Rewards and advantages. GT lists are repeated per sample to match
+        # the repeat_interleave grouping of the sampled sequences
+        gt_boxes_rep = [b for b in gt_boxes_list for _ in range(num_samples)]
+        gt_labels_rep = [
+            labels for labels in gt_labels_list for _ in range(num_samples)
+        ]
+
+        sample_rewards = self.reward_fn(
+            sequences=rollout.sequences,
+            gt_boxes_list=gt_boxes_rep,
+            gt_labels_list=gt_labels_rep,
         )
 
-        # Get valid token mask
-        mask = self.get_valid_token_mask(samples["sampled_seqs"])
+        greedy_rewards = None
+        if rollout.greedy_sequences is not None:
+            greedy_rewards = self.reward_fn(
+                sequences=rollout.greedy_sequences,
+                gt_boxes_list=gt_boxes_list,
+                gt_labels_list=gt_labels_list,
+            )
 
-        # Compute REINFORCE loss
-        rl_loss = self.compute_reinforce_loss(
-            samples["sampled_log_probs"],
-            advantages,
-            mask,
+        advantages = compute_advantages(
+            sample_rewards=sample_rewards,
+            num_samples=num_samples,
+            advantage_type=self.config.advantage_type,
+            greedy_rewards=greedy_rewards,
         )
 
-        # Compute IoU supervision loss
-        iou_loss = self.compute_iou_supervision_loss(
-            samples["sampled_seqs"],
-            samples["sampled_logits"],
-            gt_boxes_list,
+        if self.config.normalize_advantages and advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / (
+                advantages.std() + 1e-8
+            )
+
+        # 3. Teacher-forced re-scoring through the wrapped model (grads + DDP
+        # sync). Train mode to match MLE training behaviour; dropout should be
+        # 0 (checked at init) so this equals the eval-mode sampling distribution
+        self.model.train()
+        use_iou_loss = self.iou_loss_fn is not None
+        rescored = rescore_sequences(
+            model=self.model,
+            images=images,
+            sequences=rollout.sequences,
+            token_processor=self.token_processor,
+            temperature=self.config.temperature,
+            num_samples_per_image=num_samples,
+            return_class_logits=use_iou_loss,
         )
 
-        # Total loss
-        total_loss = rl_loss + self.config.iou_loss_weight * iou_loss
+        # 4. Losses
+        pg_loss, pg_stats = compute_policy_gradient_loss(
+            per_token_log_probs=rescored.log_probs,
+            advantages=advantages,
+            mask=rescored.mask,
+        )
 
-        # Optimize - use accelerator if available for multi-GPU support
-        self.optimizer.zero_grad()
+        iou_loss = torch.zeros((), device=pg_loss.device)
+        if use_iou_loss:
+            pred_boxes, _, pred_confidences = extract_object_confidences(
+                sequences=rollout.sequences,
+                class_logits=rescored.class_logits,
+                token_processor=self.token_processor,
+            )
+            iou_loss = self.iou_loss_fn(
+                pred_boxes_list=pred_boxes,
+                pred_confidences_list=pred_confidences,
+                gt_boxes_list=gt_boxes_rep,
+                device=pg_loss.device,
+            )
 
-        if self.accelerator is not None:
-            self.accelerator.backward(total_loss)
-        else:
-            total_loss.backward()
+        total_loss = pg_loss + self.config.iou_loss_weight * iou_loss
 
-        if self.config.max_grad_norm > 0:
-            if self.accelerator is not None:
-                self.accelerator.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm,
-                )
-            else:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm,
-                )
-
-        self.optimizer.step()
-
-        # Collect statistics
         stats = {
             "loss/total": total_loss.item(),
-            "loss/rl": rl_loss.item(),
-            "loss/iou": iou_loss.item() if isinstance(iou_loss, torch.Tensor) else iou_loss,
-            "reward/sample_mean": samples["sample_rewards"].mean().item(),
-            "reward/baseline_mean": samples["baseline_rewards"].mean().item(),
+            "loss/rl": pg_loss.item(),
+            "loss/iou": iou_loss.item(),
+            "reward/sample_mean": sample_rewards.mean().item(),
+            "reward/baseline_mean": (
+                greedy_rewards.mean().item()
+                if greedy_rewards is not None
+                else sample_rewards.reshape(-1, num_samples)
+                .mean(dim=1)
+                .mean()
+                .item()
+            ),
             "reward/advantage_mean": advantages.mean().item(),
-            "reward/advantage_std": advantages.std().item() if len(advantages) > 1 else 0.0,
+            "reward/advantage_std": (
+                advantages.std().item() if advantages.numel() > 1 else 0.0
+            ),
+            **pg_stats,
         }
 
-        self.global_step += 1
-        self.stats_history.append(stats)
-
-        return stats
-
-    def get_recent_stats(self, window: int = 100) -> Dict[str, float]:
-        """Get averaged statistics over recent steps.
-
-        Args:
-            window: Number of recent steps to average
-
-        Returns:
-            Dictionary of averaged statistics
-        """
-        if not self.stats_history:
-            return {}
-
-        recent = self.stats_history[-window:]
-        keys = recent[0].keys()
-
-        return {
-            key: sum(s[key] for s in recent) / len(recent)
-            for key in keys
-        }
+        return total_loss, stats
