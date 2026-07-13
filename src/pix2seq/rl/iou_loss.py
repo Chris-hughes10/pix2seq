@@ -4,7 +4,7 @@ This loss trains the model's confidence predictions to match the actual
 IoU with ground truth boxes, which helps with box ranking at test time.
 """
 
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -67,6 +67,7 @@ class IoUSupervisionLoss(nn.Module):
         pred_boxes_list: List[torch.Tensor],
         pred_confidences_list: List[torch.Tensor],
         gt_boxes_list: List[torch.Tensor],
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Compute IoU supervision loss for a batch.
 
@@ -74,6 +75,8 @@ class IoUSupervisionLoss(nn.Module):
             pred_boxes_list: List of [N_i, 4] predicted boxes per image
             pred_confidences_list: List of [N_i] confidence scores per image
             gt_boxes_list: List of [M_i, 4] ground truth boxes per image
+            device: Device for the returned loss when there are no predictions
+                (otherwise inferred from the predictions)
 
         Returns:
             loss: Scalar MSE loss between confidences and target IoUs
@@ -103,6 +106,8 @@ class IoUSupervisionLoss(nn.Module):
             total_predictions += len(pred_boxes)
 
         if total_predictions == 0:
-            return torch.tensor(0.0, requires_grad=True)
+            if device is None and len(gt_boxes_list) > 0:
+                device = gt_boxes_list[0].device
+            return torch.zeros((), device=device)
 
         return total_loss / total_predictions

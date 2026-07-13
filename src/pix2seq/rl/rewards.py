@@ -181,13 +181,15 @@ class RecallReward:
 
             avg_recall = sum(recalls) / len(recalls)
 
-            # Weight by class frequency if weights provided
+            # Weight by class frequency if weights provided. The weight scales the
+            # per-class GT count only; the recall itself stays unweighted so the
+            # result remains a weighted average of per-class recalls.
             if self.class_weights is not None:
                 weight = self.class_weights[cls].item()
             else:
                 weight = 1.0
 
-            class_recalls.append(avg_recall * weight)
+            class_recalls.append(avg_recall)
             class_counts.append(gt_mask.sum().item() * weight)
 
         # Weighted average across classes
@@ -204,19 +206,15 @@ class RecallReward:
     def __call__(
         self,
         sequences: torch.Tensor,
-        class_logits: torch.Tensor,
         gt_boxes_list: List[torch.Tensor],
         gt_labels_list: List[torch.Tensor],
-        confidence_threshold: float = 0.0,
     ) -> torch.Tensor:
         """Compute rewards for a batch of sequences.
 
         Args:
             sequences: [B, S] generated token sequences
-            class_logits: [B, N, V] logits for class tokens
             gt_boxes_list: List of [M_i, 4] ground truth boxes per image
             gt_labels_list: List of [M_i] ground truth labels per image
-            confidence_threshold: Minimum confidence to include a prediction
 
         Returns:
             rewards: [B] per-image reward values
@@ -224,12 +222,14 @@ class RecallReward:
         batch_size = sequences.size(0)
         device = sequences.device
 
-        # Decode sequences to boxes
-        pred_boxes_list, pred_labels_list, pred_scores_list = (
+        # Decode sequences to boxes. Recall does not use confidence scores, so
+        # decode without class logits: this keeps every structurally valid box
+        # (a confidence threshold of 0.0 would silently drop predictions whose
+        # padded score is exactly 0)
+        pred_boxes_list, pred_labels_list, _ = (
             self.token_processor.post_process_sequences(
                 sequences=sequences,
-                class_logits=class_logits,
-                confidence_threshold=confidence_threshold,
+                class_logits=None,
             )
         )
 
@@ -255,28 +255,3 @@ class RecallReward:
             rewards.append(reward)
 
         return torch.tensor(rewards, device=device, dtype=torch.float32)
-
-    def compute_best_iou_per_prediction(
-        self,
-        pred_boxes: torch.Tensor,
-        gt_boxes: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute best IoU for each prediction (for IoU supervision loss).
-
-        Args:
-            pred_boxes: [N, 4] predicted boxes
-            gt_boxes: [M, 4] ground truth boxes
-
-        Returns:
-            best_ious: [N] best IoU value for each prediction
-        """
-        if len(pred_boxes) == 0:
-            return torch.tensor([], device=pred_boxes.device)
-
-        if len(gt_boxes) == 0:
-            return torch.zeros(len(pred_boxes), device=pred_boxes.device)
-
-        iou_matrix = compute_iou(pred_boxes, gt_boxes)  # [N, M]
-        best_ious, _ = iou_matrix.max(dim=1)  # [N]
-
-        return best_ious
